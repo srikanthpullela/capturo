@@ -1,0 +1,209 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>SnapCraft Selection</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; user-select: none; }
+    html, body {
+      width: 100vw; height: 100vh;
+      overflow: hidden;
+      cursor: crosshair;
+    }
+    #bg {
+      position: fixed; inset: 0;
+      background: rgba(0,0,0,0.4);
+    }
+    #selection {
+      position: fixed;
+      border: 2px solid rgba(124,110,230,0.9);
+      background: rgba(124,110,230,0.08);
+      display: none;
+      pointer-events: none;
+    }
+    #hint {
+      position: fixed;
+      top: 50%;
+      left: 50%;
+      transform: translate(-50%, -50%);
+      color: #fff;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      font-size: 20px;
+      font-weight: 600;
+      text-align: center;
+      pointer-events: none;
+      text-shadow: 0 2px 8px rgba(0,0,0,0.8);
+    }
+    #hint small {
+      display: block;
+      font-size: 13px;
+      font-weight: 400;
+      margin-top: 8px;
+      opacity: 0.75;
+    }
+    #coords {
+      position: fixed;
+      top: 12px; left: 50%;
+      transform: translateX(-50%);
+      color: #fff;
+      font-family: monospace;
+      font-size: 12px;
+      background: rgba(0,0,0,0.6);
+      padding: 4px 10px;
+      border-radius: 6px;
+      pointer-events: none;
+      display: none;
+    }
+    #toolbar {
+      position: fixed;
+      display: none;
+      gap: 8px;
+      z-index: 999;
+    }
+    .tbtn {
+      padding: 8px 18px;
+      border-radius: 8px;
+      border: none;
+      font-size: 13px;
+      font-weight: 600;
+      cursor: pointer;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    .tbtn-confirm { background: #7c6ee6; color: #fff; }
+    .tbtn-cancel  { background: rgba(255,255,255,0.15); color: #fff; border: 1px solid rgba(255,255,255,0.2); }
+  </style>
+</head>
+<body>
+  <div id="bg"></div>
+  <div id="hint">
+    Drag to select an area
+    <small>Press Esc to cancel</small>
+  </div>
+  <div id="coords"></div>
+  <div id="selection"></div>
+  <div id="toolbar">
+    <button class="tbtn tbtn-cancel" id="btn-cancel">✕ Cancel</button>
+    <button class="tbtn tbtn-confirm" id="btn-capture">📸 Capture</button>
+  </div>
+
+  <script type="module">
+    const { invoke } = window.__TAURI__.core;
+    const { emit }   = window.__TAURI__.event;
+
+    const sel = document.getElementById("selection");
+    const hint = document.getElementById("hint");
+    const coords = document.getElementById("coords");
+    const toolbar = document.getElementById("toolbar");
+
+    let startX = 0, startY = 0, endX = 0, endY = 0;
+    let isDragging = false;
+    let region = null;
+
+    function updateSelection() {
+      const x = Math.min(startX, endX);
+      const y = Math.min(startY, endY);
+      const w = Math.abs(endX - startX);
+      const h = Math.abs(endY - startY);
+      sel.style.left   = x + "px";
+      sel.style.top    = y + "px";
+      sel.style.width  = w + "px";
+      sel.style.height = h + "px";
+      coords.textContent = `${Math.round(w)} × ${Math.round(h)}`;
+      return { x, y, w, h };
+    }
+
+    document.addEventListener("mousedown", (e) => {
+      if (e.button !== 0) return;
+      isDragging = true;
+      startX = e.clientX;
+      startY = e.clientY;
+      endX = e.clientX;
+      endY = e.clientY;
+      sel.style.display = "block";
+      hint.style.display = "none";
+      coords.style.display = "block";
+      toolbar.style.display = "none";
+    });
+
+    document.addEventListener("mousemove", (e) => {
+      if (!isDragging) return;
+      endX = e.clientX;
+      endY = e.clientY;
+      updateSelection();
+    });
+
+    document.addEventListener("mouseup", (e) => {
+      if (!isDragging) return;
+      isDragging = false;
+      endX = e.clientX;
+      endY = e.clientY;
+      const { x, y, w, h } = updateSelection();
+
+      if (w < 10 || h < 10) {
+        resetUI();
+        return;
+      }
+
+      region = { x, y, w, h };
+      const dpr = window.devicePixelRatio || 1;
+
+      // Position toolbar below selection (or above if near bottom)
+      const tbW = 200;
+      const tbY = y + h + 8;
+      const safeTbY = tbY + 50 > window.innerHeight ? y - 50 : tbY;
+      const tbX = Math.max(0, Math.min(x, window.innerWidth - tbW));
+      toolbar.style.left = tbX + "px";
+      toolbar.style.top  = safeTbY + "px";
+      toolbar.style.display = "flex";
+    });
+
+    document.addEventListener("keydown", (e) => {
+      if (e.key === "Escape") cancel();
+      if (e.key === "Enter" && region) doCapture();
+    });
+
+    document.getElementById("btn-cancel").addEventListener("click", cancel);
+    document.getElementById("btn-capture").addEventListener("click", doCapture);
+
+    function resetUI() {
+      sel.style.display = "none";
+      toolbar.style.display = "none";
+      coords.style.display = "none";
+      hint.style.display = "block";
+      region = null;
+    }
+
+    function cancel() {
+      invoke("close_selection_overlay").catch(console.error);
+    }
+
+    async function doCapture() {
+      if (!region) return;
+      toolbar.style.display = "none";
+      sel.style.display = "none";
+      document.getElementById("bg").style.opacity = "0";
+
+      try {
+        // Give the overlay a moment to become transparent
+        await new Promise(r => setTimeout(r, 60));
+        const base64 = await invoke("capture_screen", { monitorIndex: 0 });
+        const dpr = window.devicePixelRatio || 1;
+        await emit("screenshot-taken", {
+          base64,
+          region: {
+            x: region.x,
+            y: region.y,
+            width: region.w,
+            height: region.h,
+            scale_factor: dpr,
+          }
+        });
+        await invoke("close_selection_overlay");
+      } catch (e) {
+        console.error(e);
+        await invoke("close_selection_overlay");
+      }
+    }
+  </script>
+</body>
+</html>

@@ -939,10 +939,12 @@ export default function App() {
                       <div key={item.id} className="history-card" onClick={() => loadFromHistory(item)} title="Click to re-edit">
                         <div className="history-thumb-wrap">
                           <img className="history-thumb" src={`data:image/png;base64,${item.croppedShot}`} alt="screenshot" />
+                          <button className="history-del" onClick={(e) => deleteFromHistory(item.id, e)} title="Delete screenshot">
+                            <svg width="9" height="9" viewBox="0 0 9 9" fill="none"><path d="M1 1l7 7M8 1L1 8" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round"/></svg>
+                          </button>
                         </div>
                         <div className="history-card-footer">
                           <span className="history-time">{formatTime(item.timestamp)}</span>
-                          <button className="history-del" onClick={(e) => deleteFromHistory(item.id, e)} title="Delete">✕</button>
                         </div>
                       </div>
                     ))}

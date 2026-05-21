@@ -190,6 +190,17 @@ mod commands {
         std::fs::write(&file_path, &bytes).map_err(|e| e.to_string())
     }
 
+    /// Write a base64 PNG to a temp file for drag-out and return the file path.
+    #[tauri::command]
+    pub fn write_temp_image(id: String, base64_png: String) -> Result<String, String> {
+        let bytes = general_purpose::STANDARD
+            .decode(&base64_png)
+            .map_err(|e| e.to_string())?;
+        let path = format!("/tmp/capturo_drag_{}.png", id);
+        std::fs::write(&path, &bytes).map_err(|e| e.to_string())?;
+        Ok(path)
+    }
+
     /// Quick-save a base64 PNG to ~/Downloads/Capturo-<timestamp>.png
     #[tauri::command]
     pub fn save_to_downloads(base64_png: String, file_extension: Option<String>, filename_template: Option<String>) -> Result<String, String> {
@@ -279,6 +290,92 @@ mod commands {
     pub fn hide_main_window(app: AppHandle) {
         hide_main_window_inner(&app);
     }
+
+    /// Capture the entire screen without any interactive selection.
+    #[tauri::command]
+    pub async fn capture_fullscreen(app: AppHandle) -> Result<String, String> {
+        #[cfg(target_os = "macos")]
+        {
+            let was_visible = app
+                .get_webview_window("main")
+                .and_then(|win| win.is_visible().ok())
+                .unwrap_or(false);
+            if let Some(win) = app.get_webview_window("main") {
+                let _ = win.hide();
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(380)).await;
+
+            let tmp = format!(
+                "/tmp/capturo_fs_{}.png",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis()
+            );
+
+            let status = std::process::Command::new("screencapture")
+                .args(["-x", "-t", "png", &tmp])
+                .status()
+                .map_err(|e| format!("screencapture error: {e}"))?;
+
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+            if !status.success() || !std::path::Path::new(&tmp).exists() {
+                if was_visible {
+                    if let Some(win) = app.get_webview_window("main") {
+                        let _ = win.show();
+                        let _ = win.set_focus();
+                    }
+                }
+                return Err("fullscreen capture failed".to_string());
+            }
+
+            let mut bytes: Vec<u8> = Vec::new();
+            for _ in 0..6 {
+                if let Ok(b) = std::fs::read(&tmp) {
+                    if b.len() >= 8 { bytes = b; break; }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+            }
+            if bytes.is_empty() {
+                bytes = std::fs::read(&tmp).map_err(|e| e.to_string())?;
+            }
+            std::fs::remove_file(&tmp).ok();
+
+            const PNG_MAGIC: &[u8] = b"\x89PNG\r\n\x1a\n";
+            if bytes.len() < 8 || &bytes[..8] != PNG_MAGIC {
+                if let Some(win) = app.get_webview_window("main") {
+                    let _ = win.show();
+                    let _ = win.set_focus();
+                }
+                return Err("permission_denied".to_string());
+            }
+
+            let b64 = general_purpose::STANDARD.encode(&bytes);
+            if let Some(win) = app.get_webview_window("main") {
+                let _ = win.show();
+                let _ = win.set_focus();
+            }
+            return Ok(b64);
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            if let Some(win) = app.get_webview_window("main") {
+                let _ = win.show();
+            }
+            Err("Fullscreen capture not supported on this platform".to_string())
+        }
+    }
+
+    /// Toggle always-on-top for the main window.
+    #[tauri::command]
+    pub fn set_always_on_top(app: AppHandle, enabled: bool) -> Result<(), String> {
+        if let Some(win) = app.get_webview_window("main") {
+            win.set_always_on_top(enabled).map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    }
 }
 
 trait ImageExt {
@@ -364,8 +461,10 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             commands::capture_interactive,
+            commands::capture_fullscreen,
             commands::crop_image,
             commands::save_image,
+            commands::write_temp_image,
             commands::copy_image_to_clipboard,
             commands::save_to_downloads,
             commands::open_screen_permission_settings,
@@ -373,6 +472,7 @@ pub fn run() {
             commands::request_screen_permission,
             commands::show_main_window,
             commands::hide_main_window,
+            commands::set_always_on_top,
         ])
         .build(tauri::generate_context!())
         .expect("error while building Capturo")

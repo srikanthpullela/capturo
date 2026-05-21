@@ -89,16 +89,20 @@ html, body, #root { height: 100%; overflow: hidden; background: var(--c-bg); col
 /* ── Workspace ────────────────────────────────────────────────────── */
 .workspace { display: flex; flex: 1; overflow: hidden; }
 
+/* ── Editor pane: flex-column so footer sits below scroll area ────── */
+.editor-pane { display: flex; flex-direction: column; flex: 1; overflow: hidden; }
+.editor-body { display: flex; flex: 1; overflow: hidden; }
+
 /* ── Preview Area ─────────────────────────────────────────────────── */
 .preview {
-  flex: 1; display: flex; align-items: flex-start; justify-content: center;
-  padding: 6px 10px; overflow: auto; background: var(--c-bg);
+  flex: 1; display: flex; align-items: center; justify-content: center;
+  padding: 6px 10px; overflow: hidden; background: var(--c-bg);
   background-image: radial-gradient(ellipse 60% 50% at 50% 0%, rgba(99,102,241,0.06) 0%, transparent 100%);
 }
 
 .canvas-wrap {
-  display: flex; flex-direction: column; align-items: center; justify-content: flex-start;
-  width: 100%; min-height: 100%; overflow: visible; padding: 4px 8px 8px;
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  width: 100%; height: 100%; overflow: hidden; padding: 4px 8px 8px;
 }
 
 /* Canvas stack: screenshot canvas + annotation canvas overlaid */
@@ -107,9 +111,9 @@ html, body, #root { height: 100%; overflow: hidden; background: var(--c-bg); col
   max-width: 100%; cursor: default;
 }
 .output-canvas {
-  /* Fit within viewport — fills width for landscape, clips height for tall shots */
+  /* Scale to fit available space — toolbar (~46px) + footer (~49px) + header (~96px) + padding */
   max-width: 100%;
-  max-height: calc(100vh - 148px);
+  max-height: calc(100vh - 215px);
   width: auto;
   height: auto;
   display: block; border-radius: 4px; cursor: default;
@@ -126,25 +130,31 @@ html, body, #root { height: 100%; overflow: hidden; background: var(--c-bg); col
 
 /* ── Annotation Toolbar ──────────────────────────────────────────── */
 .ann-toolbar {
-  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
-  padding: 5px 10px; margin-bottom: 6px; width: 100%;
+  display: flex; flex-direction: row; align-items: center; flex-wrap: nowrap;
+  gap: 5px;
+  padding: 6px 10px; margin-bottom: 6px; width: 100%;
   background: var(--c-surf); border: 1px solid var(--c-border);
   border-radius: var(--r-lg);
+  overflow-x: auto;
 }
 .ann-label {
   font-size: 11px; font-weight: 700; text-transform: uppercase;
   letter-spacing: 0.07em; color: var(--c-muted); flex-shrink: 0;
 }
-.ann-tools { display: flex; gap: 4px; }
+.ann-tools { display: flex; align-items: center; gap: 5px; }
+.ann-group { display: flex; gap: 2px; }
+.ann-group-sep { width: 1px; height: 20px; background: rgba(255,255,255,0.1); margin: 0 2px; flex-shrink: 0; }
+.ann-history-actions { display: flex; gap: 4px; align-items: center; margin-left: auto; }
 .ann-tool-btn {
-  min-width: 44px; height: 44px; border-radius: var(--r-sm);
+  width: 32px; height: 32px; min-width: 32px; border-radius: var(--r-sm);
   border: 1.5px solid var(--c-border2);
   background: var(--c-surf2); color: var(--c-text);
-  font-size: 14px; cursor: pointer;
-  display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 1px;
-  padding: 0 6px;
+  cursor: pointer;
+  display: flex; align-items: center; justify-content: center;
+  padding: 0;
   transition: all 0.12s;
 }
+.ann-tool-label { display: none; }
 .ann-tool-btn:hover { background: var(--c-surf3); border-color: var(--c-accent); }
 .ann-tool-btn--active {
   background: linear-gradient(135deg, var(--c-accent), var(--c-accent2));
@@ -365,6 +375,63 @@ html, body, #root { height: 100%; overflow: hidden; background: var(--c-bg); col
   to   { opacity: 1; transform: translateX(-50%) translateY(0); }
 }
 
+/* ── Permission Hint Banner ─────────────────────────────────────── */
+.perm-hint-overlay {
+  position: fixed; inset: 0;
+  background: rgba(0,0,0,0.55);
+  backdrop-filter: blur(4px);
+  z-index: 10000;
+  display: flex; align-items: center; justify-content: center;
+  animation: toast-in 0.2s ease;
+}
+.perm-hint {
+  background: var(--c-surf2);
+  border: 1px solid var(--c-border2);
+  border-radius: var(--r-lg);
+  box-shadow: 0 16px 48px rgba(0,0,0,0.6);
+  padding: 24px 28px 20px;
+  max-width: 460px; width: 90%;
+  display: flex; flex-direction: column; gap: 14px;
+}
+.perm-hint-icon { font-size: 28px; line-height: 1; }
+.perm-hint-body { display: flex; flex-direction: column; gap: 8px; }
+.perm-hint-title {
+  font-size: 15px; font-weight: 700;
+  color: var(--c-text); margin: 0;
+}
+.perm-hint-text {
+  font-size: 13px; color: var(--c-muted); margin: 0;
+}
+.perm-hint-steps {
+  margin: 4px 0 0 0; padding-left: 18px;
+  font-size: 13px; color: var(--c-text);
+  display: flex; flex-direction: column; gap: 5px;
+}
+.perm-hint-steps code {
+  background: var(--c-surf3);
+  border-radius: 4px; padding: 1px 5px;
+  font-size: 12px;
+}
+.perm-hint-actions {
+  display: flex; gap: 8px; justify-content: flex-end;
+}
+.perm-hint-btn-open {
+  padding: 7px 16px; border-radius: var(--r-md);
+  border: none; cursor: pointer;
+  font-size: 13px; font-weight: 600; font-family: inherit;
+  background: var(--c-accent); color: #fff;
+  transition: opacity 0.15s;
+}
+.perm-hint-btn-open:hover { opacity: 0.85; }
+.perm-hint-btn-close {
+  padding: 7px 16px; border-radius: var(--r-md);
+  border: 1px solid var(--c-border2); cursor: pointer;
+  font-size: 13px; font-weight: 500; font-family: inherit;
+  background: transparent; color: var(--c-muted);
+  transition: background 0.15s;
+}
+.perm-hint-btn-close:hover { background: var(--c-surf3); }
+
 /* ── Header Tabs ─────────────────────────────────────────────────── */
 .header-tabs {
   display: flex; align-items: center; gap: 2px;
@@ -414,25 +481,23 @@ html, body, #root { height: 100%; overflow: hidden; background: var(--c-bg); col
   border-radius: var(--r-lg);
   overflow: hidden;
   cursor: pointer;
-  transition: transform 0.14s, border-color 0.14s, box-shadow 0.14s;
+  transition: border-color 0.07s, box-shadow 0.07s;
 }
 .history-card:hover {
-  transform: translateY(-2px);
   border-color: var(--c-accent);
-  box-shadow: 0 6px 24px rgba(99,102,241,0.2);
+  box-shadow: 0 4px 18px rgba(99,102,241,0.18);
 }
 
 .history-thumb-wrap {
   width: 100%; overflow: hidden; position: relative;
   background: var(--c-surf2);
   display: flex; align-items: center; justify-content: center;
-  min-height: 80px;
+  height: 140px; flex-shrink: 0;
 }
 .history-thumb {
   display: block;
-  max-width: 100%;
-  max-height: 160px;
-  width: auto; height: auto;
+  width: 100%; height: 100%;
+  object-fit: cover;
   image-rendering: -webkit-optimize-contrast;
 }
 
@@ -447,7 +512,7 @@ html, body, #root { height: 100%; overflow: hidden; background: var(--c-bg); col
   background: rgba(0,0,0,0.52); border: none; cursor: pointer;
   color: #fff; padding: 0; border-radius: 50%;
   display: flex; align-items: center; justify-content: center;
-  opacity: 0; transition: opacity 0.15s, background 0.12s;
+  opacity: 0; transition: opacity 0.06s, background 0.07s;
   backdrop-filter: blur(4px); z-index: 2;
 }
 .history-card:hover .history-del { opacity: 1; }
@@ -567,3 +632,120 @@ html, body, #root { height: 100%; overflow: hidden; background: var(--c-bg); col
   transition: all 0.12s; white-space: nowrap;
 }
 .ann-undo:hover { background: var(--c-surf3); color: var(--c-text); border-color: var(--c-accent); }
+
+.ann-redo {
+  display: inline-flex; align-items: center; gap: 4px;
+  padding: 4px 9px; border-radius: var(--r-sm);
+  border: 1.5px solid var(--c-border2);
+  background: var(--c-surf2); color: var(--c-muted);
+  font-size: 11px; font-weight: 600; cursor: pointer;
+  transition: all 0.12s; white-space: nowrap;
+}
+.ann-redo:hover { background: var(--c-surf3); color: var(--c-text); border-color: var(--c-accent); }
+
+/* ── Editor drag handle ──────────────────────────────────────────────────── */
+.editor-drag-handle {
+  position: absolute; bottom: 8px; right: 8px;
+  width: 26px; height: 26px;
+  background: rgba(0,0,0,0.45); border-radius: 6px;
+  display: flex; align-items: center; justify-content: center;
+  cursor: grab; color: #fff; opacity: 0;
+  transition: opacity 0.15s; z-index: 5;
+  backdrop-filter: blur(4px); pointer-events: none;
+}
+.canvas-stack:hover .editor-drag-handle { opacity: 1; pointer-events: auto; }
+.editor-drag-handle:hover { background: rgba(99,102,241,0.75); }
+.editor-drag-handle:active { cursor: grabbing; }
+
+/* ── Editor footer ──────────────────────────────────────────────────────── */
+.editor-footer {
+  display: flex; flex-direction: row; align-items: center; gap: 6px;
+  padding: 8px 14px;
+  background: var(--c-surf); border-top: 1px solid var(--c-border);
+  flex-shrink: 0;
+}
+.editor-footer-btn {
+  display: flex; align-items: center; gap: 5px;
+  padding: 6px 12px; border-radius: var(--r-sm);
+  border: 1px solid var(--c-border2); background: var(--c-surf2);
+  color: var(--c-text); font-size: 12px; font-weight: 500;
+  cursor: pointer; transition: background 0.1s, border-color 0.1s;
+  white-space: nowrap; flex-shrink: 0;
+}
+.editor-footer-btn:hover { background: var(--c-surf3); border-color: var(--c-accent); }
+.editor-footer-drag { cursor: grab; }
+.editor-footer-drag:active { cursor: grabbing; }
+
+/* ── Countdown overlay ──────────────────────────────────────────────────── */
+.countdown-number {
+  font-size: 96px; font-weight: 900; letter-spacing: -4px;
+  background: linear-gradient(135deg, var(--c-accent), var(--c-accent2));
+  -webkit-background-clip: text; -webkit-text-fill-color: transparent; background-clip: text;
+  animation: countdown-pulse 0.9s ease-in-out infinite;
+  line-height: 1;
+}
+@keyframes countdown-pulse {
+  0%,100% { transform: scale(1); opacity: 1; }
+  50%      { transform: scale(1.08); opacity: 0.85; }
+}
+
+/* ── Pin button ─────────────────────────────────────────────────────────── */
+.pin-btn { padding: 6px 8px; }
+.pin-btn--on {
+  background: rgba(99,102,241,0.22) !important;
+  border-color: var(--c-accent) !important;
+  color: #a5b4fc !important;
+}
+
+/* ── History copy button ────────────────────────────────────────────────── */
+.history-copy {
+  margin-left: auto;
+  height: 24px; flex-shrink: 0;
+  background: transparent; border: none; cursor: pointer;
+  color: var(--c-dim); padding: 0 6px;
+  display: flex; align-items: center; gap: 4px;
+  border-radius: var(--r-sm);
+  opacity: 0; transition: opacity 0.06s, background 0.07s, color 0.07s;
+}
+.history-copy-label {
+  font-size: 10px; font-weight: 500; letter-spacing: 0.2px;
+  color: inherit; white-space: nowrap;
+}
+.history-card:hover .history-copy { opacity: 1; }
+.history-copy:hover { background: var(--c-surf3); color: var(--c-accent2); }
+
+/* ── History drag handle ────────────────────────────────────────────────── */
+.history-drag-handle {
+  position: absolute; bottom: 6px; left: 6px;
+  width: 22px; height: 22px;
+  background: rgba(0,0,0,0.52); border: none; cursor: grab;
+  color: #fff; padding: 0; border-radius: 6px;
+  display: flex; align-items: center; justify-content: center;
+  opacity: 0; transition: opacity 0.06s, background 0.07s;
+  backdrop-filter: blur(4px); z-index: 2;
+  user-select: none;
+}
+.history-card:hover .history-drag-handle { opacity: 1; }
+.history-drag-handle:hover { background: rgba(99,102,241,0.75) !important; cursor: grab; }
+.history-drag-handle:active { cursor: grabbing; }
+
+/* ── Auto-save folder row ───────────────────────────────────────────────── */
+.pref-folder-row {
+  display: flex; align-items: center; gap: 8px;
+  background: var(--c-surf2); border: 1px solid var(--c-border);
+  border-radius: var(--r-sm); padding: 6px 10px;
+  margin-top: -4px;
+}
+.pref-folder-path {
+  flex: 1; font-size: 11px; color: var(--c-muted);
+  font-family: "SF Mono", "Fira Code", monospace;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.pref-folder-clear {
+  width: 20px; height: 20px; flex-shrink: 0;
+  background: transparent; border: none; cursor: pointer;
+  color: var(--c-dim); font-size: 12px;
+  display: flex; align-items: center; justify-content: center;
+  border-radius: 4px; transition: background 0.12s, color 0.12s;
+}
+.pref-folder-clear:hover { background: rgba(244,63,94,0.15); color: #f43f5e; }

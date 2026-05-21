@@ -2,7 +2,7 @@ import React, { useEffect, useRef, useState, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { register, unregisterAll } from "@tauri-apps/plugin-global-shortcut";
 import { listen } from "@tauri-apps/api/event";
-import { save } from "@tauri-apps/plugin-dialog";
+import { save, open as openDialog } from "@tauri-apps/plugin-dialog";
 import { writeFile } from "@tauri-apps/plugin-fs";
 import "./App.css";
 
@@ -10,7 +10,7 @@ import "./App.css";
 type AppMode = "idle" | "capturing";
 type AppTab = "editor" | "history" | "preferences";
 type SaveFormat = "png" | "jpg";
-type AnnToolId = "box" | "circle" | "arrow" | "highlight" | "pen" | "text" | "eraser";
+type AnnToolId = "box" | "circle" | "arrow" | "highlight" | "pen" | "text" | "eraser" | "redact" | "blur";
 type AnnTool = AnnToolId | null;
 
 interface AnnPoint { x: number; y: number; }
@@ -37,6 +37,8 @@ interface Preferences {
   soundEffects: boolean;
   saveFormat: SaveFormat;
   defaultFileName: string;
+  captureDelay: 0 | 3 | 5;
+  autoSavePath: string;
 }
 
 interface HistoryItem {
@@ -86,6 +88,8 @@ const DEFAULT_PREFS: Preferences = {
   soundEffects: true,
   saveFormat: "png",
   defaultFileName: "Capturo-{datetime}",
+  captureDelay: 0,
+  autoSavePath: "",
 };
 
 function parseGradStops(css: string): string[] {
@@ -215,10 +219,17 @@ export default function App() {
     }
   });
   const [toast, setToast] = useState("");
+  const [permissionHint, setPermissionHint] = useState(false);
+  const [countdown, setCountdown] = useState<number | null>(null);
+  const [alwaysOnTop, setAlwaysOnTop] = useState(false);
 
   const canvasRef    = useRef<HTMLCanvasElement>(null);
   const annCanvasRef = useRef<HTMLCanvasElement>(null);
   const imgRef       = useRef<HTMLImageElement | null>(null);
+  const tempFileCache  = useRef<Map<string, string>>(new Map());
+  const undoStack      = useRef<Annotation[][]>([]);
+  const redoStack      = useRef<Annotation[][]>([]);
+  const editorDragPath = useRef<string | null>(null);
     const annDragging   = useRef(false);
     const annStart      = useRef<AnnPoint>({ x: 0, y: 0 });
     const annDragId     = useRef<string | null>(null);
@@ -343,21 +354,70 @@ export default function App() {
       ctx.font = `700 ${fs}px -apple-system, "SF Pro Display", Arial, sans-serif`;
       ctx.fillStyle = a.color;
       ctx.fillText(a.text, a.x1, a.y1 + fs);
+    } else if (a.tool === "redact") {
+      ctx.save();
+      ctx.globalAlpha = 1;
+      ctx.fillStyle = "#000";
+      ctx.fillRect(a.x1, a.y1, a.x2 - a.x1, a.y2 - a.y1);
+      ctx.restore();
+    } else if (a.tool === "blur") {
+      // Draft preview while drawing — actual pixelation applied in redrawAnnotations
+      ctx.save();
+      ctx.fillStyle = "rgba(120,120,140,0.25)";
+      ctx.fillRect(a.x1, a.y1, a.x2 - a.x1, a.y2 - a.y1);
+      ctx.strokeStyle = "rgba(180,180,220,0.7)";
+      ctx.lineWidth = 1.2;
+      ctx.setLineDash([4, 3]);
+      ctx.strokeRect(a.x1, a.y1, a.x2 - a.x1, a.y2 - a.y1);
+      ctx.restore();
     }
   }, []);
 
   const redrawAnnotations = useCallback((anns: Annotation[], draft?: Annotation | null) => {
     const ac = annCanvasRef.current;
+    const mc = canvasRef.current;
     if (!ac) return;
     const dpr = window.devicePixelRatio || 1;
     const ctx = ac.getContext("2d")!;
-    // Reset to identity, clear full buffer, then re-apply DPR scale so all
-    // coordinates are in CSS pixels → crisp text/lines on Retina displays.
     ctx.setTransform(1, 0, 0, 1, 0, 0);
     ctx.clearRect(0, 0, ac.width, ac.height);
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-    anns.forEach(a => drawAnnotation(ctx, a));
-    if (draft) drawAnnotation(ctx, draft);
+    const all = [...anns, ...(draft ? [draft] : [])];
+    for (const a of all) {
+      if (a.tool === "blur" && mc && mc.width > 0) {
+        // Pixelate by sampling from the main (background) canvas
+        const x = Math.min(a.x1, a.x2), y = Math.min(a.y1, a.y2);
+        const w = Math.abs(a.x2 - a.x1), h = Math.abs(a.y2 - a.y1);
+        if (w < 4 || h < 4) continue;
+        const scaleX = mc.width / (ac.width / dpr);
+        const scaleY = mc.height / (ac.height / dpr);
+        const sx = Math.round(x * scaleX), sy = Math.round(y * scaleY);
+        const sw = Math.max(1, Math.round(w * scaleX)), sh = Math.max(1, Math.round(h * scaleY));
+        const mcCtx = mc.getContext("2d");
+        if (!mcCtx) { drawAnnotation(ctx, a); continue; }
+        const id = mcCtx.getImageData(sx, sy, sw, sh);
+        const d = id.data;
+        const BLOCK = 14;
+        const bw = Math.max(1, Math.round(BLOCK * scaleX));
+        const bh = Math.max(1, Math.round(BLOCK * scaleY));
+        ctx.save();
+        for (let by = 0; by < sh; by += bh) {
+          for (let bx = 0; bx < sw; bx += bw) {
+            let r=0,g=0,b=0,cnt=0;
+            for (let py=by; py<Math.min(by+bh,sh); py++)
+              for (let px=bx; px<Math.min(bx+bw,sw); px++) {
+                const i=(py*sw+px)*4; r+=d[i]; g+=d[i+1]; b+=d[i+2]; cnt++;
+              }
+            if (!cnt) continue;
+            ctx.fillStyle=`rgb(${r/cnt|0},${g/cnt|0},${b/cnt|0})`;
+            ctx.fillRect(x+(bx/scaleX), y+(by/scaleY), bw/scaleX, bh/scaleY);
+          }
+        }
+        ctx.restore();
+      } else {
+        drawAnnotation(ctx, a);
+      }
+    }
   }, [drawAnnotation]);
 
   useEffect(() => {
@@ -366,6 +426,11 @@ export default function App() {
     // Just redraw — dimensions are managed in onAnnMouseDown using CSS pixels
     redrawAnnotations(annotations, annDraft);
   }, [annotations, annDraft, croppedShot, padding, redrawAnnotations]);
+
+  const pushUndo = (current: Annotation[]) => {
+    undoStack.current.push([...current]);
+    redoStack.current = [];
+  };
 
   const onAnnMouseDown = (e: React.MouseEvent<HTMLCanvasElement>) => {
     const canvas = e.currentTarget as HTMLCanvasElement;
@@ -377,6 +442,7 @@ export default function App() {
     if (!annTool) {
       const hit = [...annotations].reverse().find(a => hitAnnotation(a, pos.x, pos.y));
       if (hit) {
+        pushUndo(annotations);
         annDragId.current = hit.id;
         annDragOffset.current = { x: pos.x - hit.x1, y: pos.y - hit.y1 };
         annDragging.current = true;
@@ -402,7 +468,10 @@ export default function App() {
     // Eraser: click to delete nearest annotation
     if (annTool === "eraser") {
       const hit = [...annotations].reverse().find(a => hitAnnotation(a, pos.x, pos.y));
-      if (hit) setAnnotations(prev => prev.filter(a => a.id !== hit.id));
+      if (hit) {
+        pushUndo(annotations);
+        setAnnotations(prev => prev.filter(a => a.id !== hit.id));
+      }
       return;
     }
 
@@ -460,6 +529,7 @@ export default function App() {
     if (annDragId.current) { annDragId.current = null; annDragging.current = false; return; }
     if (!annDragging.current || !annTool || !annDraft) { annDragging.current = false; return; }
     annDragging.current = false;
+    pushUndo(annotations);
     setAnnotations(prev => [...prev, { ...annDraft, id: Date.now().toString() }]);
     setAnnDraft(null);
     if (annTool === "pen") penPoints.current = [];
@@ -547,6 +617,13 @@ export default function App() {
     captureInProgress.current = true;
     setMode("capturing");
     try {
+      if (preferences.captureDelay > 0) {
+        for (let i = preferences.captureDelay; i > 0; i--) {
+          setCountdown(i);
+          await new Promise(resolve => setTimeout(resolve, 1000));
+        }
+        setCountdown(null);
+      }
       await new Promise(resolve => setTimeout(resolve, 250));
       const b64 = await invoke<string>("capture_interactive", { hideWindow: preferences.hideWindowOnCapture });
         // Force cursor reset — hold default cursor class for 900ms after window shows.
@@ -562,11 +639,15 @@ export default function App() {
             croppedShot: b64, bg: BACKGROUNDS.find(b => b.id === 'candy') ?? BACKGROUNDS[0], padding: 48, radius: 12, shadow: 60, blur: 0,
         }, ...prev].slice(0, 40));
       }
+      if (preferences.autoSavePath) {
+        const fname = makeFileName(preferences.defaultFileName, preferences.saveFormat);
+        await invoke("save_image", { base64Png: b64, filePath: `${preferences.autoSavePath}/${fname}` }).catch(() => {});
+      }
       playDoneSound();
     } catch (e) {
       const msg = String(e);
       if (msg.includes("permission_denied")) {
-        showToast("Screen Recording denied. Grant permission to \"screencapture\" in System Settings → Privacy → Screen Recording.");
+        setPermissionHint(true);
       } else if (!msg.includes("cancelled")) {
         showToast(`Capture failed: ${msg}`);
       }
@@ -576,6 +657,7 @@ export default function App() {
       setMode("idle");
     } finally {
       captureInProgress.current = false;
+      setCountdown(null);
     }
   };
 
@@ -590,14 +672,38 @@ export default function App() {
     const ctx = flat.getContext("2d")!;
     ctx.drawImage(mc, 0, 0);
     if (ac.width > 0 && ac.height > 0) {
-      // Ann-canvas buffer is cssW*dpr × cssH*dpr; annotations are drawn in CSS pixel space.
-      // Scale to output-canvas (full screenshot) resolution for export.
       const dpr = window.devicePixelRatio || 1;
       const sx = mc.width / (ac.width / dpr);
       const sy = mc.height / (ac.height / dpr);
-      ctx.save(); ctx.scale(sx, sy);
-      annotations.forEach(a => drawAnnotation(ctx, a));
-      ctx.restore();
+      // Draw annotations in order; apply proper pixelation for blur
+      for (const a of annotations) {
+        if (a.tool === "blur") {
+          const x = Math.round(Math.min(a.x1, a.x2) * sx);
+          const y = Math.round(Math.min(a.y1, a.y2) * sy);
+          const w = Math.round(Math.abs(a.x2 - a.x1) * sx);
+          const h = Math.round(Math.abs(a.y2 - a.y1) * sy);
+          if (w < 4 || h < 4) continue;
+          const id = ctx.getImageData(x, y, w, h);
+          const d = id.data;
+          const BLOCK = Math.max(8, Math.round(14 * Math.min(sx, sy)));
+          for (let by = 0; by < h; by += BLOCK) {
+            for (let bx = 0; bx < w; bx += BLOCK) {
+              let r=0,g=0,b=0,cnt=0;
+              for (let py=by; py<Math.min(by+BLOCK,h); py++)
+                for (let px=bx; px<Math.min(bx+BLOCK,w); px++) {
+                  const i=(py*w+px)*4; r+=d[i]; g+=d[i+1]; b+=d[i+2]; cnt++;
+                }
+              if (!cnt) continue;
+              ctx.fillStyle=`rgb(${r/cnt|0},${g/cnt|0},${b/cnt|0})`;
+              ctx.fillRect(x+bx, y+by, Math.min(BLOCK,w-bx), Math.min(BLOCK,h-by));
+            }
+          }
+        } else {
+          ctx.save(); ctx.scale(sx, sy);
+          drawAnnotation(ctx, a);
+          ctx.restore();
+        }
+      }
     } else {
       ctx.drawImage(ac, 0, 0, mc.width, mc.height);
     }
@@ -670,17 +776,32 @@ export default function App() {
         const mc = canvasRef.current;
         if (mc) { ac.width = mc.offsetWidth || ac.width; ac.height = mc.offsetHeight || ac.height; }
       }
-      setAnnotations(prev => [...prev, {
-        id: Date.now().toString(), tool: "text",
-        x1: textInput.x, y1: textInput.y, x2: textInput.x, y2: textInput.y,
-        color: annColor, lineWidth: annLineWidth,
-        text: value, fontSize,
-      }]);
+      setAnnotations(prev => {
+        pushUndo(prev);
+        return [...prev, {
+          id: Date.now().toString(), tool: "text",
+          x1: textInput.x, y1: textInput.y, x2: textInput.x, y2: textInput.y,
+          color: annColor, lineWidth: annLineWidth,
+          text: value, fontSize,
+        }];
+      });
     }
     setTextInput(null); setTextInputValue("");
   };
 
-  const handleUndo = () => setAnnotations(prev => prev.slice(0, -1));
+  const handleUndo = () => setAnnotations(curr => {
+    if (!undoStack.current.length) return curr;
+    const prev = undoStack.current.pop()!;
+    redoStack.current.push([...curr]);
+    return prev;
+  });
+
+  const handleRedo = () => setAnnotations(curr => {
+    if (!redoStack.current.length) return curr;
+    const next = redoStack.current.pop()!;
+    undoStack.current.push([...curr]);
+    return next;
+  });
 
   const loadFromHistory = (item: HistoryItem) => {
     setCroppedShot(item.croppedShot);
@@ -694,6 +815,151 @@ export default function App() {
     setHistory(prev => prev.filter(h => h.id !== id));
   };
 
+  const prewriteTempFile = async (item: HistoryItem) => {
+    const key = String(item.id);
+    if (tempFileCache.current.has(key)) return;
+    try {
+      const path = await invoke<string>('write_temp_image', {
+        id: key,
+        base64Png: item.croppedShot,
+      });
+      tempFileCache.current.set(key, path);
+    } catch {}
+  };
+
+  const prewriteEditorTempFile = async () => {
+    const canvas = getFlatCanvas();
+    if (!canvas) return;
+    const b64 = canvas.toDataURL("image/png").split(",")[1];
+    try {
+      const path = await invoke<string>('write_temp_image', { id: 'editor_current', base64Png: b64 });
+      editorDragPath.current = path;
+    } catch {}
+  };
+
+  const handleEditorDragStart = (e: React.DragEvent) => {
+    const path = editorDragPath.current;
+    if (path) {
+      e.dataTransfer.effectAllowed = 'copy';
+      e.dataTransfer.setData('text/uri-list', `file://${path}`);
+      e.dataTransfer.setData('text/plain', `file://${path}`);
+    } else {
+      e.preventDefault();
+    }
+  };
+
+  const handleHistoryDragStart = (item: HistoryItem, e: React.DragEvent<HTMLDivElement>) => {
+    const path = tempFileCache.current.get(String(item.id));
+    if (path) {
+      e.dataTransfer.effectAllowed = 'copy';
+      e.dataTransfer.setData('text/uri-list', `file://${path}`);
+      e.dataTransfer.setData('text/plain', `file://${path}`);
+      e.stopPropagation();
+    } else {
+      e.preventDefault();
+    }
+  };
+
+  const copyHistoryItem = async (item: HistoryItem, e: React.MouseEvent) => {
+    e.stopPropagation();
+    const img = new Image();
+    img.src = `data:image/png;base64,${item.croppedShot}`;
+    await new Promise<void>(resolve => { img.onload = () => resolve(); });
+    const iw = img.naturalWidth, ih = img.naturalHeight;
+    const pad = item.padding;
+    const cw = iw + pad * 2, ch = ih + pad * 2;
+    const temp = document.createElement("canvas");
+    temp.width = cw; temp.height = ch;
+    const ctx = temp.getContext("2d")!;
+    const { bg, radius, shadow, blur } = item;
+    if (bg.css === "transparent") {
+      ctx.clearRect(0, 0, cw, ch);
+    } else if (bg.css.startsWith("linear-gradient")) {
+      const stops = parseGradStops(bg.css);
+      const grad = ctx.createLinearGradient(0, 0, cw, ch);
+      stops.forEach((c, i) => grad.addColorStop(i / (stops.length - 1), c));
+      ctx.fillStyle = grad; ctx.fillRect(0, 0, cw, ch);
+    } else {
+      ctx.fillStyle = bg.css; ctx.fillRect(0, 0, cw, ch);
+    }
+    ctx.save();
+    if (shadow > 0) {
+      ctx.shadowColor = "rgba(0,0,0,0.55)";
+      ctx.shadowBlur = shadow * 1.5;
+      ctx.shadowOffsetY = shadow * 0.4;
+    }
+    const r = radius, x = pad, y = pad, w = iw, h = ih;
+    ctx.beginPath();
+    ctx.moveTo(x+r,y); ctx.lineTo(x+w-r,y); ctx.quadraticCurveTo(x+w,y,x+w,y+r);
+    ctx.lineTo(x+w,y+h-r); ctx.quadraticCurveTo(x+w,y+h,x+w-r,y+h);
+    ctx.lineTo(x+r,y+h); ctx.quadraticCurveTo(x,y+h,x,y+h-r);
+    ctx.lineTo(x,y+r); ctx.quadraticCurveTo(x,y,x+r,y);
+    ctx.closePath(); ctx.clip();
+    if (blur > 0) ctx.filter = `blur(${blur}px)`;
+    ctx.drawImage(img, x, y, w, h);
+    if (blur > 0) ctx.filter = "none";
+    ctx.restore();
+    const b64 = temp.toDataURL("image/png").split(",")[1];
+    try {
+      await invoke("copy_image_to_clipboard", { base64Png: b64 });
+      playDoneSound();
+      showToast("Copied!");
+    } catch (err) { showToast(`Copy failed: ${err}`); }
+  };
+
+  const toggleAlwaysOnTop = async () => {
+    const next = !alwaysOnTop;
+    setAlwaysOnTop(next);
+    await invoke("set_always_on_top", { enabled: next }).catch(() => {});
+    showToast(next ? "Pinned on top" : "Unpinned");
+  };
+
+  const captureFullscreen = async () => {
+    if (captureInProgress.current) return;
+    captureInProgress.current = true;
+    setMode("capturing");
+    try {
+      if (preferences.captureDelay > 0) {
+        for (let i = preferences.captureDelay; i > 0; i--) {
+          setCountdown(i);
+          await new Promise(resolve => setTimeout(resolve, 1000));
+        }
+        setCountdown(null);
+      }
+      const b64 = await invoke<string>("capture_fullscreen");
+      document.body.classList.add("capturo-reset-cursor");
+      setTimeout(() => document.body.classList.remove("capturo-reset-cursor"), 900);
+      setCroppedShot(b64);
+      setAnnotations([]); setAnnDraft(null); setAnnTool(null);
+      setMode("idle");
+      setActiveTab("editor");
+      if (preferences.saveHistory) {
+        setHistory(prev => [{
+          id: Date.now().toString(), timestamp: Date.now(),
+          croppedShot: b64, bg: BACKGROUNDS.find(b => b.id === 'candy') ?? BACKGROUNDS[0], padding: 48, radius: 12, shadow: 60, blur: 0,
+        }, ...prev].slice(0, 40));
+      }
+      if (preferences.autoSavePath) {
+        const fname = makeFileName(preferences.defaultFileName, preferences.saveFormat);
+        await invoke("save_image", { base64Png: b64, filePath: `${preferences.autoSavePath}/${fname}` }).catch(() => {});
+      }
+      playDoneSound();
+    } catch (e) {
+      const msg = String(e);
+      if (msg.includes("permission_denied")) {
+        setPermissionHint(true);
+      } else if (!msg.includes("cancelled")) {
+        showToast(`Capture failed: ${msg}`);
+      }
+      document.body.classList.add("capturo-reset-cursor");
+      setTimeout(() => document.body.classList.remove("capturo-reset-cursor"), 900);
+      setMode("idle");
+    } finally {
+      captureInProgress.current = false;
+      setCountdown(null);
+    }
+  };
+
   const hasShot = !!croppedShot;
 
   // ── Render ───────────────────────────────────────────────────────────────
@@ -703,8 +969,17 @@ export default function App() {
       {/* ── CAPTURING SPINNER ── */}
       {mode === "capturing" && (
         <div className="capture-screen">
-          <div className="spinner" />
-          <p>Preparing capture…</p>
+          {countdown !== null ? (
+            <>
+              <div className="countdown-number">{countdown}</div>
+              <p>Capturing in {countdown}s…</p>
+            </>
+          ) : (
+            <>
+              <div className="spinner" />
+              <p>Preparing capture…</p>
+            </>
+          )}
         </div>
       )}
 
@@ -732,6 +1007,17 @@ export default function App() {
               {hasShot && activeTab === "editor" && (
                 <button className="btn btn-ghost" onClick={startNew}>← New</button>
               )}
+              <button
+                className={`btn btn-ghost pin-btn${alwaysOnTop ? " pin-btn--on" : ""}`}
+                onClick={toggleAlwaysOnTop}
+                title={alwaysOnTop ? "Unpin window" : "Pin window on top"}
+              >
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M12 17v5"/><path d="M9 10.76a2 2 0 0 1-1.11 1.79l-1.78.9A2 2 0 0 0 5 15.24V17h14v-1.76a2 2 0 0 0-1.11-1.79l-1.78-.9A2 2 0 0 1 15 10.76V6h1a2 2 0 0 0 0-4H8a2 2 0 0 0 0 4h1v4.76z"/></svg>
+              </button>
+              <button className="btn btn-ghost" onClick={captureFullscreen} title="Capture full screen">
+                <svg width="14" height="14" viewBox="0 0 14 14" fill="none"><rect x="1" y="1" width="12" height="12" rx="1.5" stroke="currentColor" strokeWidth="1.4"/><path d="M4 1v3H1M10 1v3h3M4 13v-3H1M10 13v-3h3" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round"/></svg>
+                Fullscreen
+              </button>
               <button className="btn btn-primary" onClick={triggerCapture}>
                 <svg width="14" height="14" viewBox="0 0 14 14" fill="none"><rect x="1" y="3" width="12" height="9" rx="2" stroke="currentColor" strokeWidth="1.5"/><circle cx="7" cy="7.5" r="2" stroke="currentColor" strokeWidth="1.5"/><path d="M4 3V2.5C4 2.2 4.2 2 4.5 2h5C9.8 2 10 2.2 10 2.5V3" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round"/></svg>
                 Screenshot
@@ -744,52 +1030,93 @@ export default function App() {
 
             {/* ── EDITOR TAB ── */}
             {activeTab === "editor" && (
-              <>
+              <div className="editor-pane">
+                <div className="editor-body">
                 <main className="preview">
                   {hasShot ? (
                     <div className="canvas-wrap">
                       <div className="ann-toolbar">
                         <div className="ann-tools">
-                          {([
-                            { id: "box",       title: "Box",       icon: <svg width="16" height="16" viewBox="0 0 16 16" fill="none"><rect x="1.5" y="1.5" width="13" height="13" rx="1.5" stroke="currentColor" strokeWidth="1.8"/></svg> },
-                            { id: "circle",    title: "Circle",    icon: <svg width="16" height="16" viewBox="0 0 16 16" fill="none"><circle cx="8" cy="8" r="5.5" stroke="currentColor" strokeWidth="1.8"/></svg> },
-                            { id: "arrow",     title: "Arrow",     icon: <svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M3 13L13 3M13 3H7M13 3v6" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"/></svg> },
-                            { id: "highlight", title: "Highlight", icon: <svg width="16" height="16" viewBox="0 0 16 16" fill="none"><rect x="1" y="5" width="14" height="6" rx="1" fill="currentColor" fillOpacity="0.5"/></svg> },
-                            { id: "pen",       title: "Pen",       icon: <svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M2 14l3-1 8-8-2-2-8 8-1 3z" stroke="currentColor" strokeWidth="1.5" strokeLinejoin="round"/><path d="M9 5l2 2" stroke="currentColor" strokeWidth="1.5"/></svg> },
-                            { id: "text",      title: "Text",      icon: <svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M3 4h10M8 4v9M6 13h4" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"/></svg> },
-                            { id: "eraser",    title: "Eraser",    icon: <svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M2 12l2.5-2.5 5-5 2 2-5 5-2.5 2.5-2-2z" stroke="currentColor" strokeWidth="1.6" strokeLinejoin="round"/><path d="M9.5 4.5l2 2" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round"/><path d="M2 14h5.5" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round"/></svg> },
-                          ] as { id: AnnToolId; title: string; icon: React.ReactNode }[]).map(t => (
-                            <button
-                              key={t.id} title={t.title}
-                              className={`ann-tool-btn${annTool === t.id ? " ann-tool-btn--active" : ""}`}
-                              onClick={() => setAnnTool(prev => prev === t.id ? null : t.id)}
-                            >{t.icon}<span className="ann-tool-label">{t.title}</span></button>
-                          ))}
-                        </div>
-                        {annTool && (<>
-                          <div className="ann-divider" />
+                          {/* Shapes */}
+                          <div className="ann-group">
+                            {([
+                              { id: "box",    title: "Box",    icon: <svg width="15" height="15" viewBox="0 0 16 16" fill="none"><rect x="1.5" y="1.5" width="13" height="13" rx="1.5" stroke="currentColor" strokeWidth="1.8"/></svg> },
+                              { id: "circle", title: "Circle", icon: <svg width="15" height="15" viewBox="0 0 16 16" fill="none"><circle cx="8" cy="8" r="5.5" stroke="currentColor" strokeWidth="1.8"/></svg> },
+                            ] as { id: AnnToolId; title: string; icon: React.ReactNode }[]).map(t => (
+                              <button key={t.id} title={t.title}
+                                className={`ann-tool-btn${annTool === t.id ? " ann-tool-btn--active" : ""}`}
+                                onClick={() => setAnnTool(prev => prev === t.id ? null : t.id)}
+                              >{t.icon}</button>
+                            ))}
+                          </div>
+                          <div className="ann-group-sep" />
+                          {/* Lines & freehand */}
+                          <div className="ann-group">
+                            {([
+                              { id: "arrow",     title: "Arrow",     icon: <svg width="15" height="15" viewBox="0 0 16 16" fill="none"><path d="M3 13L13 3M13 3H7M13 3v6" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"/></svg> },
+                              { id: "pen",       title: "Pen",       icon: <svg width="15" height="15" viewBox="0 0 16 16" fill="none"><path d="M2 14l3-1 8-8-2-2-8 8-1 3z" stroke="currentColor" strokeWidth="1.5" strokeLinejoin="round"/><path d="M9 5l2 2" stroke="currentColor" strokeWidth="1.5"/></svg> },
+                              { id: "highlight", title: "Highlight", icon: <svg width="15" height="15" viewBox="0 0 16 16" fill="none"><rect x="1" y="5" width="14" height="6" rx="1" fill="currentColor" fillOpacity="0.5"/></svg> },
+                            ] as { id: AnnToolId; title: string; icon: React.ReactNode }[]).map(t => (
+                              <button key={t.id} title={t.title}
+                                className={`ann-tool-btn${annTool === t.id ? " ann-tool-btn--active" : ""}`}
+                                onClick={() => setAnnTool(prev => prev === t.id ? null : t.id)}
+                              >{t.icon}</button>
+                            ))}
+                          </div>
+                          <div className="ann-group-sep" />
+                          {/* Text */}
+                          <div className="ann-group">
+                            <button title="Text"
+                              className={`ann-tool-btn${annTool === "text" ? " ann-tool-btn--active" : ""}`}
+                              onClick={() => setAnnTool(prev => prev === "text" ? null : "text")}
+                            ><svg width="15" height="15" viewBox="0 0 16 16" fill="none"><path d="M3 4h10M8 4v9M6 13h4" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"/></svg></button>
+                          </div>
+                          <div className="ann-group-sep" />
+                          {/* Edit tools */}
+                          <div className="ann-group">
+                            {([
+                              { id: "eraser", title: "Eraser", icon: <svg width="15" height="15" viewBox="0 0 16 16" fill="none"><path d="M2 12l2.5-2.5 5-5 2 2-5 5-2.5 2.5-2-2z" stroke="currentColor" strokeWidth="1.6" strokeLinejoin="round"/><path d="M9.5 4.5l2 2" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round"/><path d="M2 14h5.5" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round"/></svg> },
+                              { id: "redact", title: "Redact", icon: <svg width="15" height="15" viewBox="0 0 16 16" fill="none"><rect x="2" y="5" width="12" height="6" rx="1" fill="currentColor"/></svg> },
+                              { id: "blur",   title: "Blur",   icon: <svg width="15" height="15" viewBox="0 0 16 16" fill="none"><rect x="2" y="4" width="12" height="8" rx="1.5" stroke="currentColor" strokeWidth="1.6"/><path d="M5 7h6M5 9h4" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" opacity="0.5"/></svg> },
+                            ] as { id: AnnToolId; title: string; icon: React.ReactNode }[]).map(t => (
+                              <button key={t.id} title={t.title}
+                                className={`ann-tool-btn${annTool === t.id ? " ann-tool-btn--active" : ""}`}
+                                onClick={() => setAnnTool(prev => prev === t.id ? null : t.id)}
+                              >{t.icon}</button>
+                            ))}
+                          </div>
+                          <div className="ann-group-sep" />
+                          {/* Colors — always visible */}
                           <div className="ann-colors">
                             {ANN_COLORS.map(c => (
                               <button key={c} className={`ann-color${annColor === c ? " ann-color--active" : ""}`}
                                 style={{ background: c }} onClick={() => setAnnColor(c)} />
                             ))}
                           </div>
-                          <div className="ann-divider" />
+                          <div className="ann-group-sep" />
+                          {/* Size — always visible */}
                           <div className="ann-width-row">
                             <span className="ann-width-label">Size</span>
                             <input type="range" min={1} max={20} value={annLineWidth}
                               className="ann-width-slider" onChange={e => setAnnLineWidth(+e.target.value)} />
                             <span className="ann-width-val">{annLineWidth}</span>
                           </div>
-                        </>)}
-                        {annotations.length > 0 && (<>
-                          <div className="ann-divider" />
-                          <button className="ann-undo" onClick={handleUndo} title="Undo last annotation (⌘Z)">
-                            <svg width="13" height="13" viewBox="0 0 13 13" fill="none"><path d="M2 4.5h5a3.5 3.5 0 0 1 0 7H3" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round"/><path d="M4.5 2L2 4.5l2.5 2.5" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round"/></svg>
-                            Undo
-                          </button>
-                          <button className="ann-clear" onClick={() => setAnnotations([])}>✕ Clear</button>
-                        </>)}
+                          {/* Undo / Redo / Clear — pushed right, shown only when needed */}
+                          {annotations.length > 0 && (
+                            <>
+                              <div className="ann-group-sep" />
+                              <button className="ann-undo" onClick={handleUndo} title="Undo (⌘Z)">
+                                <svg width="12" height="12" viewBox="0 0 13 13" fill="none"><path d="M2 4.5h5a3.5 3.5 0 0 1 0 7H3" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round"/><path d="M4.5 2L2 4.5l2.5 2.5" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round"/></svg>
+                                Undo
+                              </button>
+                              <button className="ann-redo" onClick={handleRedo} title="Redo (⌘⇧Z)">
+                                <svg width="12" height="12" viewBox="0 0 13 13" fill="none"><path d="M11 4.5H6a3.5 3.5 0 0 0 0 7h4" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round"/><path d="M8.5 2L11 4.5 8.5 7" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round"/></svg>
+                                Redo
+                              </button>
+                              <button className="ann-clear" onClick={() => { pushUndo(annotations); setAnnotations([]); }}>✕ Clear</button>
+                            </>
+                          )}
+                        </div>
                       </div>
 
                       <div className="canvas-stack">
@@ -915,7 +1242,39 @@ export default function App() {
                     </div>
                   </aside>
                 )}
-              </>
+                </div>
+                {/* ── Editor footer — outside scroll ── */}
+                {croppedShot && (
+                  <div className="editor-footer">
+                    <button className="editor-footer-btn" onClick={handleCopy} title="Copy to clipboard">
+                      <svg width="15" height="15" viewBox="0 0 15 15" fill="none"><rect x="5" y="5" width="8" height="8" rx="1.5" stroke="currentColor" strokeWidth="1.4"/><path d="M3 10V3a1 1 0 0 1 1-1h7" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round"/></svg>
+                      Copy
+                    </button>
+                    <button className="editor-footer-btn" onClick={handleSave} title="Save to Downloads">
+                      <svg width="15" height="15" viewBox="0 0 15 15" fill="none"><path d="M7.5 2v8M4 7l3.5 3.5L11 7" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round"/><path d="M2 12h11" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round"/></svg>
+                      Save
+                    </button>
+                    <button className="editor-footer-btn" onClick={handleSaveAs} title="Save As…">
+                      <svg width="15" height="15" viewBox="0 0 15 15" fill="none"><path d="M2 10v2a1 1 0 0 0 1 1h9a1 1 0 0 0 1-1v-2" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round"/><path d="M7.5 2v8M4 6l3.5-3.5L11 6" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round"/></svg>
+                      Save As
+                    </button>
+                    <div
+                      className="editor-footer-btn editor-footer-drag"
+                      draggable
+                      onDragStart={handleEditorDragStart}
+                      onMouseEnter={prewriteEditorTempFile}
+                      title="Drag to Finder / folder"
+                    >
+                      <svg width="15" height="15" viewBox="0 0 15 15" fill="none">
+                        <circle cx="5" cy="4" r="1.2" fill="currentColor"/><circle cx="10" cy="4" r="1.2" fill="currentColor"/>
+                        <circle cx="5" cy="7.5" r="1.2" fill="currentColor"/><circle cx="10" cy="7.5" r="1.2" fill="currentColor"/>
+                        <circle cx="5" cy="11" r="1.2" fill="currentColor"/><circle cx="10" cy="11" r="1.2" fill="currentColor"/>
+                      </svg>
+                      Drag
+                    </div>
+                  </div>
+                )}
+              </div>
             )}
 
             {/* ── HISTORY TAB ── */}
@@ -936,15 +1295,22 @@ export default function App() {
                 ) : (
                   <div className="history-grid">
                     {history.map(item => (
-                      <div key={item.id} className="history-card" onClick={() => loadFromHistory(item)} title="Click to re-edit">
-                        <div className="history-thumb-wrap">
+                      <div key={item.id} className="history-card" onClick={() => loadFromHistory(item)} title="Click to re-edit" onMouseEnter={() => prewriteTempFile(item)}>
+                        <div className="history-thumb-wrap" draggable onDragStart={(e) => handleHistoryDragStart(item, e)}>
                           <img className="history-thumb" src={`data:image/png;base64,${item.croppedShot}`} alt="screenshot" />
                           <button className="history-del" onClick={(e) => deleteFromHistory(item.id, e)} title="Delete screenshot">
                             <svg width="9" height="9" viewBox="0 0 9 9" fill="none"><path d="M1 1l7 7M8 1L1 8" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round"/></svg>
                           </button>
+                          <div className="history-drag-handle" title="Drag to Finder / folder">
+                            <svg width="11" height="11" viewBox="0 0 11 11" fill="none"><circle cx="3" cy="2.5" r="1" fill="currentColor"/><circle cx="8" cy="2.5" r="1" fill="currentColor"/><circle cx="3" cy="5.5" r="1" fill="currentColor"/><circle cx="8" cy="5.5" r="1" fill="currentColor"/><circle cx="3" cy="8.5" r="1" fill="currentColor"/><circle cx="8" cy="8.5" r="1" fill="currentColor"/></svg>
+                          </div>
                         </div>
                         <div className="history-card-footer">
                           <span className="history-time">{formatTime(item.timestamp)}</span>
+                          <button className="history-copy" onClick={(e) => copyHistoryItem(item, e)} title="Copy image to clipboard">
+                            <svg width="12" height="12" viewBox="0 0 12 12" fill="none"><rect x="4" y="4" width="7" height="7" rx="1.2" stroke="currentColor" strokeWidth="1.3"/><path d="M3 8H2a1 1 0 0 1-1-1V2a1 1 0 0 1 1-1h5a1 1 0 0 1 1 1v1" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round"/></svg>
+                            <span className="history-copy-label">⌘C</span>
+                          </button>
                         </div>
                       </div>
                     ))}
@@ -970,6 +1336,14 @@ export default function App() {
                     <label className="pref-toggle"><input type="checkbox" checked={preferences.hideWindowOnCapture} onChange={e => updatePref("hideWindowOnCapture", e.target.checked)} /><span>Hide Capturo while taking screenshot</span></label>
                     <label className="pref-toggle"><input type="checkbox" checked={preferences.hideAtLaunch} onChange={e => updatePref("hideAtLaunch", e.target.checked)} /><span>Always hide this window at launch</span></label>
                     <label className="pref-toggle"><input type="checkbox" checked={preferences.soundEffects} onChange={e => updatePref("soundEffects", e.target.checked)} /><span>Enable sound effects</span></label>
+                    <div className="pref-row">
+                      <span>Capture delay</span>
+                      <div className="segmented">
+                        <button className={preferences.captureDelay === 0 ? "seg-on" : ""} onClick={() => updatePref("captureDelay", 0)}>Off</button>
+                        <button className={preferences.captureDelay === 3 ? "seg-on" : ""} onClick={() => updatePref("captureDelay", 3)}>3s</button>
+                        <button className={preferences.captureDelay === 5 ? "seg-on" : ""} onClick={() => updatePref("captureDelay", 5)}>5s</button>
+                      </div>
+                    </div>
                   </section>
 
                   <section className="pref-section">
@@ -991,6 +1365,19 @@ export default function App() {
                       <span>Default file name</span>
                       <input value={preferences.defaultFileName} onChange={e => updatePref("defaultFileName", e.target.value)} placeholder="Capturo-{datetime}" />
                     </label>
+                    <div className="pref-row">
+                      <span>Auto-save to folder</span>
+                      <button className="btn btn-ghost" style={{ fontSize: 12, padding: "4px 10px" }} onClick={async () => {
+                        const folder = await openDialog({ directory: true, multiple: false });
+                        if (typeof folder === "string") updatePref("autoSavePath", folder);
+                      }}>{preferences.autoSavePath ? "Change folder" : "Choose folder…"}</button>
+                    </div>
+                    {preferences.autoSavePath && (
+                      <div className="pref-folder-row">
+                        <span className="pref-folder-path">{preferences.autoSavePath}</span>
+                        <button className="pref-folder-clear" onClick={() => updatePref("autoSavePath", "")}>✕</button>
+                      </div>
+                    )}
                   </section>
 
                   <section className="pref-section">
@@ -1010,6 +1397,30 @@ export default function App() {
       )}
 
       {toast && <div className="toast">{toast}</div>}
+
+      {permissionHint && (
+        <div className="perm-hint-overlay" onClick={() => setPermissionHint(false)}>
+          <div className="perm-hint" onClick={e => e.stopPropagation()}>
+            <div className="perm-hint-icon">🔒</div>
+            <div className="perm-hint-body">
+              <p className="perm-hint-title">Screen Recording permission issue?</p>
+              <p className="perm-hint-text">
+                If the permission dialog keeps reappearing even after granting access, the fix is:
+              </p>
+              <ol className="perm-hint-steps">
+                <li>Open <strong>System Settings → Privacy &amp; Security → Screen &amp; System Audio Recording</strong></li>
+                <li>Find <strong>Capturo</strong> in the list and <strong>remove it</strong> (click the <code>–</code> button)</li>
+                <li>Take a screenshot — macOS will prompt again</li>
+                <li>Grant permission — it will now stick permanently</li>
+              </ol>
+            </div>
+            <div className="perm-hint-actions">
+              <button className="perm-hint-btn-open" onClick={() => { invoke("open_screen_permission_settings"); }}>Open Settings</button>
+              <button className="perm-hint-btn-close" onClick={() => setPermissionHint(false)}>Dismiss</button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

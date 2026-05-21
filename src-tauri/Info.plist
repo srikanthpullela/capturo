@@ -6,5 +6,9 @@
   <string>Capturo</string>
   <key>CFBundleName</key>
   <string>Capturo</string>
+  <key>NSScreenCaptureUsageDescription</key>
+  <string>Capturo needs screen recording access to take screenshots.</string>
+  <key>NSCameraUsageDescription</key>
+  <string>Capturo does not use the camera.</string>
 </dict>
 </plist>

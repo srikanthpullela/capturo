@@ -223,6 +223,9 @@ export default function App() {
   const [countdown, setCountdown] = useState<number | null>(null);
   const [alwaysOnTop, setAlwaysOnTop] = useState(false);
 
+  const isWindows = navigator.userAgent.includes('Windows');
+  const [winCapture, setWinCapture] = useState<{ base64: string; screenWidth: number; screenHeight: number } | null>(null);
+
   const canvasRef    = useRef<HTMLCanvasElement>(null);
   const annCanvasRef = useRef<HTMLCanvasElement>(null);
   const imgRef       = useRef<HTMLImageElement | null>(null);
@@ -625,6 +628,13 @@ export default function App() {
         setCountdown(null);
       }
       await new Promise(resolve => setTimeout(resolve, 250));
+      if (isWindows) {
+        const data = await invoke<{ base64: string; screenWidth: number; screenHeight: number }>('capture_full_screen_windows');
+        setWinCapture(data);
+        setMode('idle');
+        captureInProgress.current = false;
+        return;
+      }
       const b64 = await invoke<string>("capture_interactive", { hideWindow: preferences.hideWindowOnCapture });
         // Force cursor reset — hold default cursor class for 900ms after window shows.
         document.body.classList.add("capturo-reset-cursor");
@@ -659,6 +669,27 @@ export default function App() {
       captureInProgress.current = false;
       setCountdown(null);
     }
+  };
+
+  // ── Windows capture selection callback ───────────────────────────────────
+  const handleWindowsSelection = async (b64: string) => {
+    setWinCapture(null);
+    await invoke('exit_windows_capture').catch(() => {});
+    setCroppedShot(b64);
+    setAnnotations([]); setAnnDraft(null); setAnnTool(null);
+    setMode('idle');
+    setActiveTab('editor');
+    if (preferences.saveHistory) {
+      setHistory(prev => [{
+        id: Date.now().toString(), timestamp: Date.now(),
+        croppedShot: b64, bg: BACKGROUNDS.find(b => b.id === 'candy') ?? BACKGROUNDS[0], padding: 48, radius: 12, shadow: 60, blur: 0,
+      }, ...prev].slice(0, 40));
+    }
+    if (preferences.autoSavePath) {
+      const fname = makeFileName(preferences.defaultFileName, preferences.saveFormat);
+      await invoke('save_image', { base64Png: b64, filePath: `${preferences.autoSavePath}/${fname}` }).catch(() => {});
+    }
+    playDoneSound();
   };
 
   // ── Export (flatten annotations) ─────────────────────────────────────────
@@ -965,6 +996,22 @@ export default function App() {
   // ── Render ───────────────────────────────────────────────────────────────
   return (
     <div className="app">
+
+      {/* ── WINDOWS CAPTURE OVERLAY ── */}
+      {winCapture && (
+        <WinSelectionOverlay
+          base64={winCapture.base64}
+          screenWidth={winCapture.screenWidth}
+          screenHeight={winCapture.screenHeight}
+          onCapture={handleWindowsSelection}
+          onCancel={() => {
+            setWinCapture(null);
+            invoke('exit_windows_capture').catch(() => {});
+            setMode('idle');
+            captureInProgress.current = false;
+          }}
+        />
+      )}
 
       {/* ── CAPTURING SPINNER ── */}
       {mode === "capturing" && (
@@ -1421,6 +1468,85 @@ export default function App() {
           </div>
         </div>
       )}
+    </div>
+  );
+}
+
+// ── Windows selection overlay ─────────────────────────────────────────────
+function WinSelectionOverlay({ base64, screenWidth, screenHeight, onCapture, onCancel }: {
+  base64: string; screenWidth: number; screenHeight: number;
+  onCapture: (b64: string) => void; onCancel: () => void;
+}) {
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const imgRef    = useRef<HTMLImageElement>(null);
+  const [drag, setDrag]   = React.useState<{ x: number; y: number } | null>(null);
+  const [rect, setRect]   = React.useState<{ x: number; y: number; w: number; h: number } | null>(null);
+
+  React.useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    canvas.width  = window.innerWidth;
+    canvas.height = window.innerHeight;
+  }, []);
+
+  React.useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    if (rect && rect.w > 2 && rect.h > 2) {
+      ctx.fillStyle = 'rgba(0,0,0,0.45)';
+      ctx.fillRect(0, 0, canvas.width, rect.y);
+      ctx.fillRect(0, rect.y + rect.h, canvas.width, canvas.height - rect.y - rect.h);
+      ctx.fillRect(0, rect.y, rect.x, rect.h);
+      ctx.fillRect(rect.x + rect.w, rect.y, canvas.width - rect.x - rect.w, rect.h);
+      ctx.strokeStyle = '#6366f1';
+      ctx.lineWidth   = 2;
+      ctx.strokeRect(rect.x, rect.y, rect.w, rect.h);
+    } else {
+      ctx.fillStyle = 'rgba(0,0,0,0.35)';
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+    }
+  }, [rect]);
+
+  const handleMouseDown = (e: React.MouseEvent) => {
+    setDrag({ x: e.clientX, y: e.clientY });
+    setRect(null);
+  };
+  const handleMouseMove = (e: React.MouseEvent) => {
+    if (!drag) return;
+    setRect({ x: Math.min(drag.x, e.clientX), y: Math.min(drag.y, e.clientY), w: Math.abs(e.clientX - drag.x), h: Math.abs(e.clientY - drag.y) });
+  };
+  const handleMouseUp = () => {
+    if (!drag || !rect || rect.w < 10 || rect.h < 10) { setDrag(null); setRect(null); return; }
+    setDrag(null);
+    const img = imgRef.current;
+    if (!img) return;
+    const scaleX = screenWidth / window.innerWidth;
+    const scaleY = screenHeight / window.innerHeight;
+    const offscreen = document.createElement('canvas');
+    offscreen.width  = Math.round(rect.w * scaleX);
+    offscreen.height = Math.round(rect.h * scaleY);
+    const ctx = offscreen.getContext('2d');
+    if (!ctx) return;
+    ctx.drawImage(img, rect.x * scaleX, rect.y * scaleY, rect.w * scaleX, rect.h * scaleY, 0, 0, offscreen.width, offscreen.height);
+    onCapture(offscreen.toDataURL('image/png').replace('data:image/png;base64,', ''));
+  };
+
+  return (
+    <div
+      className="win-capture-overlay"
+      tabIndex={0}
+      onMouseDown={handleMouseDown}
+      onMouseMove={handleMouseMove}
+      onMouseUp={handleMouseUp}
+      onKeyDown={e => { if (e.key === 'Escape') onCancel(); }}
+      ref={el => el?.focus()}
+    >
+      <img ref={imgRef} src={`data:image/png;base64,${base64}`} className="win-capture-bg" draggable={false} />
+      <canvas ref={canvasRef} className="win-capture-canvas" />
+      <div className="win-capture-hint">Drag to select a region · Esc to cancel</div>
     </div>
   );
 }

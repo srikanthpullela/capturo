@@ -376,6 +376,69 @@ mod commands {
         }
         Ok(())
     }
+
+    /// Windows: capture the primary screen and go fullscreen so the
+    /// frontend can show a selection overlay on top of the screenshot.
+    #[tauri::command]
+    pub async fn capture_full_screen_windows(app: AppHandle) -> Result<serde_json::Value, String> {
+        if let Some(win) = app.get_webview_window("main") {
+            let _ = win.hide();
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(350)).await;
+
+        #[cfg(target_os = "windows")]
+        {
+            use xcap::Monitor;
+            let monitors = Monitor::all().map_err(|e| e.to_string())?;
+            let monitor = monitors
+                .iter()
+                .find(|m| m.is_primary())
+                .or_else(|| monitors.first())
+                .ok_or_else(|| "No monitor found".to_string())?;
+
+            let image = monitor.capture_image().map_err(|e| e.to_string())?;
+            let (width, height) = (image.width(), image.height());
+            let dyn_img = DynamicImage::ImageRgba8(image);
+            let mut buf = Vec::new();
+            dyn_img
+                .write_to(&mut Cursor::new(&mut buf), ImageFormat::Png)
+                .map_err(|e| e.to_string())?;
+            let b64 = general_purpose::STANDARD.encode(&buf);
+
+            // Maximize so the selection overlay covers the entire screen
+            if let Some(win) = app.get_webview_window("main") {
+                let _ = win.set_fullscreen(true);
+                let _ = win.show();
+                let _ = win.set_focus();
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+
+            return Ok(serde_json::json!({
+                "base64": b64,
+                "screenWidth": width,
+                "screenHeight": height
+            }));
+        }
+
+        #[allow(unreachable_code)]
+        {
+            if let Some(win) = app.get_webview_window("main") {
+                let _ = win.show();
+            }
+            Err("Windows-only command".to_string())
+        }
+    }
+
+    /// Windows: exit fullscreen after the user finishes the selection overlay.
+    #[tauri::command]
+    pub async fn exit_windows_capture(app: AppHandle) -> Result<(), String> {
+        if let Some(win) = app.get_webview_window("main") {
+            let _ = win.set_fullscreen(false);
+            let _ = win.show();
+            let _ = win.set_focus();
+        }
+        Ok(())
+    }
 }
 
 trait ImageExt {
@@ -473,6 +536,8 @@ pub fn run() {
             commands::show_main_window,
             commands::hide_main_window,
             commands::set_always_on_top,
+            commands::capture_full_screen_windows,
+            commands::exit_windows_capture,
         ])
         .build(tauri::generate_context!())
         .expect("error while building Capturo")

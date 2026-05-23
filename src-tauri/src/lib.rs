@@ -388,22 +388,28 @@ mod commands {
 
         #[cfg(target_os = "windows")]
         {
-            use xcap::Monitor;
-            let monitors = Monitor::all().map_err(|e| e.to_string())?;
-            let monitor = monitors
-                .iter()
-                .find(|m| m.is_primary().unwrap_or(false))
-                .or_else(|| monitors.first())
-                .ok_or_else(|| "No monitor found".to_string())?;
+            // xcap::Monitor is !Send, so all capture work must happen in spawn_blocking
+            let (b64, width, height) = tokio::task::spawn_blocking(|| -> Result<(String, u32, u32), String> {
+                use xcap::Monitor;
+                let monitors = Monitor::all().map_err(|e| e.to_string())?;
+                let monitor = monitors
+                    .iter()
+                    .find(|m| m.is_primary().unwrap_or(false))
+                    .or_else(|| monitors.first())
+                    .ok_or_else(|| "No monitor found".to_string())?;
 
-            let image = monitor.capture_image().map_err(|e| e.to_string())?;
-            let (width, height) = (image.width(), image.height());
-            let dyn_img = DynamicImage::ImageRgba8(image);
-            let mut buf = Vec::new();
-            dyn_img
-                .write_to(&mut Cursor::new(&mut buf), ImageFormat::Png)
-                .map_err(|e| e.to_string())?;
-            let b64 = general_purpose::STANDARD.encode(&buf);
+                let image = monitor.capture_image().map_err(|e| e.to_string())?;
+                let (width, height) = (image.width(), image.height());
+                let dyn_img = DynamicImage::ImageRgba8(image);
+                let mut buf = Vec::new();
+                dyn_img
+                    .write_to(&mut Cursor::new(&mut buf), ImageFormat::Png)
+                    .map_err(|e| e.to_string())?;
+                let b64 = general_purpose::STANDARD.encode(&buf);
+                Ok((b64, width, height))
+            })
+            .await
+            .map_err(|e| e.to_string())??;
 
             // Maximize so the selection overlay covers the entire screen
             if let Some(win) = app.get_webview_window("main") {

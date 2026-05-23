@@ -392,7 +392,7 @@ mod commands {
             let monitors = Monitor::all().map_err(|e| e.to_string())?;
             let monitor = monitors
                 .iter()
-                .find(|m| m.is_primary())
+                .find(|m| m.is_primary().unwrap_or(false))
                 .or_else(|| monitors.first())
                 .ok_or_else(|| "No monitor found".to_string())?;
 

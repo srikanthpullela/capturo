@@ -124,10 +124,10 @@ function CapturoLogo({ size = 28 }: { size?: number }) {
   );
 }
 
-function drawWatermark(ctx: CanvasRenderingContext2D, cw: number, ch: number, padding: number) {
+function drawWatermark(ctx: CanvasRenderingContext2D, cw: number, ch: number, wmPadding: number, framePad: number = 0) {
   const shortSide = Math.max(1, Math.min(cw, ch));
   const fontSize = Math.max(12, Math.min(18, Math.round(shortSide * 0.017)));
-  const margin = Math.max(18, padding);
+  const margin = Math.max(18, wmPadding);
   const label = "Screenshot by Capturo";
 
   ctx.save();
@@ -138,7 +138,7 @@ function drawWatermark(ctx: CanvasRenderingContext2D, cw: number, ch: number, pa
   ctx.shadowBlur = Math.max(3, fontSize * 0.35);
   ctx.shadowOffsetY = Math.max(1, fontSize * 0.08);
   ctx.fillStyle = "rgba(255,255,255,0.92)";
-  ctx.fillText(label, cw - margin, ch - margin);
+  ctx.fillText(label, cw - framePad - margin, ch - framePad - margin);
   ctx.restore();
 }
 
@@ -316,7 +316,7 @@ export default function App() {
     ctx.drawImage(img, x, y, w, h);
     if (blur > 0) ctx.filter = "none";
     ctx.restore();
-    if (preferences.includeWatermark) drawWatermark(ctx, cw, ch, preferences.watermarkPadding);
+    if (preferences.includeWatermark) drawWatermark(ctx, cw, ch, preferences.watermarkPadding, padding);
     }, [bg, padding, radius, shadow, blur, preferences.includeWatermark, preferences.watermarkPadding]);
 
   useEffect(() => {

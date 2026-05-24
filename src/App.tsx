@@ -127,18 +127,27 @@ function CapturoLogo({ size = 28 }: { size?: number }) {
 function drawWatermark(ctx: CanvasRenderingContext2D, cw: number, ch: number, wmPadding: number, framePad: number = 0) {
   const shortSide = Math.max(1, Math.min(cw, ch));
   const fontSize = Math.max(12, Math.min(18, Math.round(shortSide * 0.017)));
-  const margin = Math.max(18, wmPadding);
   const label = "Screenshot by Capturo";
 
   ctx.save();
   ctx.font = `700 ${fontSize}px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif`;
-  ctx.textAlign = "right";
-  ctx.textBaseline = "bottom";
   ctx.shadowColor = "rgba(0,0,0,0.55)";
   ctx.shadowBlur = Math.max(3, fontSize * 0.35);
   ctx.shadowOffsetY = Math.max(1, fontSize * 0.08);
   ctx.fillStyle = "rgba(255,255,255,0.92)";
-  ctx.fillText(label, cw - framePad - margin, ch - framePad - margin);
+
+  if (framePad >= 20) {
+    // Place centred in the bottom frame strip (below the screenshot image)
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.fillText(label, cw / 2, ch - framePad / 2);
+  } else {
+    // No frame (or tiny frame) — fall back to inside image, bottom-right
+    const margin = Math.max(18, wmPadding);
+    ctx.textAlign = "right";
+    ctx.textBaseline = "bottom";
+    ctx.fillText(label, cw - margin, ch - margin);
+  }
   ctx.restore();
 }
 

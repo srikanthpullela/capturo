@@ -2,6 +2,11 @@ import React, { useEffect, useRef, useState, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { register, unregisterAll } from "@tauri-apps/plugin-global-shortcut";
 import { listen } from "@tauri-apps/api/event";
+
+function isTauri(): boolean {
+  return typeof window !== "undefined" &&
+    !!(window as unknown as Record<string, unknown>).__TAURI_INTERNALS__;
+}
 import { save, open as openDialog } from "@tauri-apps/plugin-dialog";
 import { writeFile } from "@tauri-apps/plugin-fs";
 import "./App.css";
@@ -540,6 +545,7 @@ export default function App() {
 
   // ── Global shortcut ──────────────────────────────────────────────────────
   useEffect(() => {
+    if (!isTauri()) return;
     register(SHORTCUT_ACCELERATOR, triggerCapture).catch(console.error);
     return () => { unregisterAll().catch(console.error); };
   }, []);
@@ -549,7 +555,7 @@ export default function App() {
   }, [preferences]);
 
   useEffect(() => {
-    if (preferences.hideAtLaunch) {
+    if (preferences.hideAtLaunch && isTauri()) {
       const timer = setTimeout(() => { invoke("hide_main_window").catch(() => {}); }, 500);
       return () => clearTimeout(timer);
     }
@@ -557,12 +563,14 @@ export default function App() {
 
   // ── Tray event ───────────────────────────────────────────────────────────
   useEffect(() => {
+    if (!isTauri()) return;
     let unlisten: (() => void) | null = null;
     listen<void>("tray-screenshot", () => triggerCapture()).then(fn => { unlisten = fn; });
     return () => { unlisten?.(); };
   }, []);
 
   useEffect(() => {
+    if (!isTauri()) return;
     let unlisten: (() => void) | null = null;
     listen<void>("open-preferences", () => {
       setMode("idle");
@@ -573,6 +581,7 @@ export default function App() {
 
   // ── Cursor reset event (emitted from Rust before window shows) ────────────
   useEffect(() => {
+    if (!isTauri()) return;
     let unlisten: (() => void) | null = null;
     listen<void>("cursor-reset", () => {
       document.body.classList.add("capturo-reset-cursor");
@@ -628,6 +637,12 @@ export default function App() {
         setCountdown(null);
       }
       await new Promise(resolve => setTimeout(resolve, 250));
+      if (!isTauri()) {
+        showToast("Capture requires the desktop app");
+        setMode("idle");
+        captureInProgress.current = false;
+        return;
+      }
       if (isWindows) {
         const data = await invoke<{ base64: string; screenWidth: number; screenHeight: number }>('capture_full_screen_windows');
         setWinCapture(data);
@@ -649,7 +664,7 @@ export default function App() {
             croppedShot: b64, bg: BACKGROUNDS.find(b => b.id === 'candy') ?? BACKGROUNDS[0], padding: 48, radius: 12, shadow: 60, blur: 0,
         }, ...prev].slice(0, 40));
       }
-      if (preferences.autoSavePath) {
+      if (preferences.autoSavePath && isTauri()) {
         const fname = makeFileName(preferences.defaultFileName, preferences.saveFormat);
         await invoke("save_image", { base64Png: b64, filePath: `${preferences.autoSavePath}/${fname}` }).catch(() => {});
       }
@@ -674,7 +689,7 @@ export default function App() {
   // ── Windows capture selection callback ───────────────────────────────────
   const handleWindowsSelection = async (b64: string) => {
     setWinCapture(null);
-    await invoke('exit_windows_capture').catch(() => {});
+    if (isTauri()) await invoke('exit_windows_capture').catch(() => {});
     setCroppedShot(b64);
     setAnnotations([]); setAnnDraft(null); setAnnTool(null);
     setMode('idle');
@@ -685,7 +700,7 @@ export default function App() {
         croppedShot: b64, bg: BACKGROUNDS.find(b => b.id === 'candy') ?? BACKGROUNDS[0], padding: 48, radius: 12, shadow: 60, blur: 0,
       }, ...prev].slice(0, 40));
     }
-    if (preferences.autoSavePath) {
+    if (preferences.autoSavePath && isTauri()) {
       const fname = makeFileName(preferences.defaultFileName, preferences.saveFormat);
       await invoke('save_image', { base64Png: b64, filePath: `${preferences.autoSavePath}/${fname}` }).catch(() => {});
     }
@@ -746,9 +761,9 @@ export default function App() {
     if (!canvas) return;
     const b64 = canvas.toDataURL("image/png").split(",")[1];
     try {
-      await invoke("copy_image_to_clipboard", { base64Png: b64 });
+      if (isTauri()) await invoke("copy_image_to_clipboard", { base64Png: b64 });
       playDoneSound();
-      if (preferences.closeAfterCopy) await invoke("hide_main_window");
+      if (preferences.closeAfterCopy && isTauri()) await invoke("hide_main_window");
       else showToast("Copied to clipboard!");
     } catch (e) { showToast(`Copy failed: ${e}`); }
   };
@@ -772,13 +787,14 @@ export default function App() {
     const mime = preferences.saveFormat === "jpg" ? "image/jpeg" : "image/png";
     const b64 = canvas.toDataURL(mime, 0.92).split(",")[1];
     try {
+      if (!isTauri()) return;
       const filename = await invoke<string>("save_to_downloads", {
         base64Png: b64,
         fileExtension: preferences.saveFormat,
         filenameTemplate: preferences.defaultFileName,
       });
       playDoneSound();
-      showToast(`Saved → Downloads/${filename}`);
+      showToast(`Saved \u2192 Downloads/${filename}`);
     } catch (e) { showToast(`Save failed: ${e}`); }
   };
 
@@ -850,6 +866,7 @@ export default function App() {
     const key = String(item.id);
     if (tempFileCache.current.has(key)) return;
     try {
+      if (!isTauri()) return;
       const path = await invoke<string>('write_temp_image', {
         id: key,
         base64Png: item.croppedShot,
@@ -863,6 +880,7 @@ export default function App() {
     if (!canvas) return;
     const b64 = canvas.toDataURL("image/png").split(",")[1];
     try {
+      if (!isTauri()) return;
       const path = await invoke<string>('write_temp_image', { id: 'editor_current', base64Png: b64 });
       editorDragPath.current = path;
     } catch {}
@@ -932,7 +950,7 @@ export default function App() {
     ctx.restore();
     const b64 = temp.toDataURL("image/png").split(",")[1];
     try {
-      await invoke("copy_image_to_clipboard", { base64Png: b64 });
+      if (isTauri()) await invoke("copy_image_to_clipboard", { base64Png: b64 });
       playDoneSound();
       showToast("Copied!");
     } catch (err) { showToast(`Copy failed: ${err}`); }
@@ -941,7 +959,7 @@ export default function App() {
   const toggleAlwaysOnTop = async () => {
     const next = !alwaysOnTop;
     setAlwaysOnTop(next);
-    await invoke("set_always_on_top", { enabled: next }).catch(() => {});
+    if (isTauri()) await invoke("set_always_on_top", { enabled: next }).catch(() => {});
     showToast(next ? "Pinned on top" : "Unpinned");
   };
 
@@ -957,6 +975,7 @@ export default function App() {
         }
         setCountdown(null);
       }
+      if (!isTauri()) { showToast("Capture requires the desktop app"); setMode("idle"); captureInProgress.current = false; return; }
       const b64 = await invoke<string>("capture_fullscreen");
       document.body.classList.add("capturo-reset-cursor");
       setTimeout(() => document.body.classList.remove("capturo-reset-cursor"), 900);
@@ -970,7 +989,7 @@ export default function App() {
           croppedShot: b64, bg: BACKGROUNDS.find(b => b.id === 'candy') ?? BACKGROUNDS[0], padding: 48, radius: 12, shadow: 60, blur: 0,
         }, ...prev].slice(0, 40));
       }
-      if (preferences.autoSavePath) {
+      if (preferences.autoSavePath && isTauri()) {
         const fname = makeFileName(preferences.defaultFileName, preferences.saveFormat);
         await invoke("save_image", { base64Png: b64, filePath: `${preferences.autoSavePath}/${fname}` }).catch(() => {});
       }
@@ -1006,7 +1025,7 @@ export default function App() {
           onCapture={handleWindowsSelection}
           onCancel={() => {
             setWinCapture(null);
-            invoke('exit_windows_capture').catch(() => {});
+            if (isTauri()) invoke('exit_windows_capture').catch(() => {});
             setMode('idle');
             captureInProgress.current = false;
           }}
@@ -1462,7 +1481,7 @@ export default function App() {
               </ol>
             </div>
             <div className="perm-hint-actions">
-              <button className="perm-hint-btn-open" onClick={() => { invoke("open_screen_permission_settings"); }}>Open Settings</button>
+              <button className="perm-hint-btn-open" onClick={() => { if (isTauri()) invoke("open_screen_permission_settings"); }}>Open Settings</button>
               <button className="perm-hint-btn-close" onClick={() => setPermissionHint(false)}>Dismiss</button>
             </div>
           </div>

@@ -137,10 +137,11 @@ function drawWatermark(ctx: CanvasRenderingContext2D, cw: number, ch: number, wm
   ctx.fillStyle = "rgba(255,255,255,0.92)";
 
   if (framePad >= 20) {
-    // Place centred in the bottom frame strip (below the screenshot image)
-    ctx.textAlign = "center";
+    // Place right-aligned in the bottom frame strip (below the screenshot image)
+    const margin = Math.max(18, wmPadding);
+    ctx.textAlign = "right";
     ctx.textBaseline = "middle";
-    ctx.fillText(label, cw / 2, ch - framePad / 2);
+    ctx.fillText(label, cw - margin, ch - framePad / 2);
   } else {
     // No frame (or tiny frame) — fall back to inside image, bottom-right
     const margin = Math.max(18, wmPadding);

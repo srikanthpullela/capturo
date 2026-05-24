@@ -15,7 +15,7 @@ import "./App.css";
 type AppMode = "idle" | "capturing";
 type AppTab = "editor" | "history" | "preferences";
 type SaveFormat = "png" | "jpg";
-type AnnToolId = "box" | "circle" | "arrow" | "highlight" | "pen" | "text" | "eraser" | "redact" | "blur";
+type AnnToolId = "box" | "circle" | "arrow" | "line" | "highlight" | "pen" | "text" | "eraser" | "redact" | "blur";
 type AnnTool = AnnToolId | null;
 
 interface AnnPoint { x: number; y: number; }
@@ -252,7 +252,7 @@ export default function App() {
   const showToast = (msg: string) => {
     setToast(msg);
     if (toastTimer.current) clearTimeout(toastTimer.current);
-    toastTimer.current = setTimeout(() => setToast(""), 2400);
+    toastTimer.current = setTimeout(() => setToast(""), 2000);
   };
 
   const updatePref = <K extends keyof Preferences>(key: K, value: Preferences[K]) => {
@@ -349,6 +349,8 @@ export default function App() {
       ctx.beginPath(); ctx.ellipse(cx, cy, rx, ry, 0, 0, Math.PI * 2); ctx.stroke();
     } else if (a.tool === "arrow") {
       drawArrow(ctx, a.x1, a.y1, a.x2, a.y2, a.lineWidth);
+    } else if (a.tool === "line") {
+      ctx.beginPath(); ctx.moveTo(a.x1, a.y1); ctx.lineTo(a.x2, a.y2); ctx.stroke();
     } else if (a.tool === "highlight") {
       ctx.globalAlpha = 0.38;
       ctx.fillRect(a.x1, a.y1, a.x2 - a.x1, a.y2 - a.y1);
@@ -585,7 +587,7 @@ export default function App() {
     let unlisten: (() => void) | null = null;
     listen<void>("cursor-reset", () => {
       document.body.classList.add("capturo-reset-cursor");
-      setTimeout(() => document.body.classList.remove("capturo-reset-cursor"), 900);
+      setTimeout(() => document.body.classList.remove("capturo-reset-cursor"), 600);
     }).then(fn => { unlisten = fn; });
     return () => { unlisten?.(); };
   }, []);
@@ -614,7 +616,7 @@ export default function App() {
       if (!document.hidden) {
         if (imgRef.current) composite();
         document.body.classList.add("capturo-reset-cursor");
-        setTimeout(() => document.body.classList.remove("capturo-reset-cursor"), 900);
+        setTimeout(() => document.body.classList.remove("capturo-reset-cursor"), 600);
       }
     };
     document.addEventListener("visibilitychange", onVisible);
@@ -636,9 +638,7 @@ export default function App() {
         }
         setCountdown(null);
       }
-      await new Promise(resolve => setTimeout(resolve, 250));
       if (!isTauri()) {
-        showToast("Capture requires the desktop app");
         setMode("idle");
         captureInProgress.current = false;
         return;
@@ -653,7 +653,7 @@ export default function App() {
       const b64 = await invoke<string>("capture_interactive", { hideWindow: preferences.hideWindowOnCapture });
         // Force cursor reset — hold default cursor class for 900ms after window shows.
         document.body.classList.add("capturo-reset-cursor");
-        setTimeout(() => document.body.classList.remove("capturo-reset-cursor"), 900);
+        setTimeout(() => document.body.classList.remove("capturo-reset-cursor"), 600);
       setCroppedShot(b64);
       setAnnotations([]); setAnnDraft(null); setAnnTool(null);
       setMode("idle");
@@ -677,7 +677,7 @@ export default function App() {
         showToast(`Capture failed: ${msg}`);
       }
       document.body.classList.add("capturo-reset-cursor");
-      setTimeout(() => document.body.classList.remove("capturo-reset-cursor"), 900);
+      setTimeout(() => document.body.classList.remove("capturo-reset-cursor"), 600);
       setAnnTool(null);
       setMode("idle");
     } finally {
@@ -978,7 +978,7 @@ export default function App() {
       if (!isTauri()) { showToast("Capture requires the desktop app"); setMode("idle"); captureInProgress.current = false; return; }
       const b64 = await invoke<string>("capture_fullscreen");
       document.body.classList.add("capturo-reset-cursor");
-      setTimeout(() => document.body.classList.remove("capturo-reset-cursor"), 900);
+      setTimeout(() => document.body.classList.remove("capturo-reset-cursor"), 600);
       setCroppedShot(b64);
       setAnnotations([]); setAnnDraft(null); setAnnTool(null);
       setMode("idle");
@@ -1002,7 +1002,7 @@ export default function App() {
         showToast(`Capture failed: ${msg}`);
       }
       document.body.classList.add("capturo-reset-cursor");
-      setTimeout(() => document.body.classList.remove("capturo-reset-cursor"), 900);
+      setTimeout(() => document.body.classList.remove("capturo-reset-cursor"), 600);
       setMode("idle");
     } finally {
       captureInProgress.current = false;
@@ -1120,6 +1120,7 @@ export default function App() {
                           <div className="ann-group">
                             {([
                               { id: "arrow",     title: "Arrow",     icon: <svg width="15" height="15" viewBox="0 0 16 16" fill="none"><path d="M3 13L13 3M13 3H7M13 3v6" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"/></svg> },
+                              { id: "line",      title: "Line",      icon: <svg width="15" height="15" viewBox="0 0 16 16" fill="none"><path d="M2 14L14 2" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round"/></svg> },
                               { id: "pen",       title: "Pen",       icon: <svg width="15" height="15" viewBox="0 0 16 16" fill="none"><path d="M2 14l3-1 8-8-2-2-8 8-1 3z" stroke="currentColor" strokeWidth="1.5" strokeLinejoin="round"/><path d="M9 5l2 2" stroke="currentColor" strokeWidth="1.5"/></svg> },
                               { id: "highlight", title: "Highlight", icon: <svg width="15" height="15" viewBox="0 0 16 16" fill="none"><rect x="1" y="5" width="14" height="6" rx="1" fill="currentColor" fillOpacity="0.5"/></svg> },
                             ] as { id: AnnToolId; title: string; icon: React.ReactNode }[]).map(t => (

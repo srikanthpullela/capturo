@@ -9,8 +9,7 @@ function isTauri(): boolean {
 }
 import { save, open as openDialog } from "@tauri-apps/plugin-dialog";
 import { enable as autostartEnable, disable as autostartDisable, isEnabled as autostartIsEnabled } from "@tauri-apps/plugin-autostart";
-import { writeFile, writeTextFile, readTextFile, mkdir } from "@tauri-apps/plugin-fs";
-import { appLocalDataDir } from "@tauri-apps/api/path";
+import { writeFile } from "@tauri-apps/plugin-fs";
 import "./App.css";
 
 // ── Types ──────────────────────────────────────────────────────────────────
@@ -644,8 +643,7 @@ export default function App() {
     }
     (async () => {
       try {
-        const dir = await appLocalDataDir();
-        const text = await readTextFile(`${dir}/capturo_history.json`);
+        const text = await invoke<string>("load_history");
         const parsed = JSON.parse(text);
         if (Array.isArray(parsed)) setHistory(parsed);
       } catch {
@@ -670,13 +668,7 @@ export default function App() {
       try { localStorage.setItem("capturo_history", JSON.stringify(history)); } catch {}
       return;
     }
-    (async () => {
-      try {
-        const dir = await appLocalDataDir();
-        await mkdir(dir, { recursive: true });
-        await writeTextFile(`${dir}/capturo_history.json`, JSON.stringify(history));
-      } catch {}
-    })();
+    invoke("save_history", { data: JSON.stringify(history) }).catch(() => {});
   }, [history, preferences.saveHistory]);
 
   // ── Repaint canvas + cursor fix when window becomes visible ───────────────

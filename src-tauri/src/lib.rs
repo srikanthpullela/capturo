@@ -445,6 +445,25 @@ mod commands {
         }
         Ok(())
     }
+
+    /// Persist screenshot history JSON to the app-local-data directory.
+    #[tauri::command]
+    pub async fn save_history(app: AppHandle, data: String) -> Result<(), String> {
+        let dir = app.path().app_local_data_dir()
+            .map_err(|e| e.to_string())?;
+        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        std::fs::write(dir.join("capturo_history.json"), data.as_bytes())
+            .map_err(|e| e.to_string())
+    }
+
+    /// Load screenshot history JSON from the app-local-data directory.
+    #[tauri::command]
+    pub async fn load_history(app: AppHandle) -> Result<String, String> {
+        let path = app.path().app_local_data_dir()
+            .map_err(|e| e.to_string())?
+            .join("capturo_history.json");
+        std::fs::read_to_string(&path).map_err(|e| e.to_string())
+    }
 }
 
 trait ImageExt {
@@ -545,6 +564,8 @@ pub fn run() {
             commands::set_always_on_top,
             commands::capture_full_screen_windows,
             commands::exit_windows_capture,
+            commands::save_history,
+            commands::load_history,
         ])
         .build(tauri::generate_context!())
         .expect("error while building Capturo")

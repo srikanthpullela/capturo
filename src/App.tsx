@@ -8,6 +8,7 @@ function isTauri(): boolean {
     !!(window as unknown as Record<string, unknown>).__TAURI_INTERNALS__;
 }
 import { save, open as openDialog } from "@tauri-apps/plugin-dialog";
+import { enable as autostartEnable, disable as autostartDisable, isEnabled as autostartIsEnabled } from "@tauri-apps/plugin-autostart";
 import { writeFile } from "@tauri-apps/plugin-fs";
 import "./App.css";
 
@@ -37,6 +38,7 @@ interface Preferences {
   saveHistory: boolean;
   hideWindowOnCapture: boolean;
   hideAtLaunch: boolean;
+  openAtLogin: boolean;
   includeWatermark: boolean;
   watermarkPadding: number;
   soundEffects: boolean;
@@ -88,6 +90,7 @@ const DEFAULT_PREFS: Preferences = {
   saveHistory: true,
   hideWindowOnCapture: true,
   hideAtLaunch: false,
+  openAtLogin: false,
   includeWatermark: true,
   watermarkPadding: 32,
   soundEffects: true,
@@ -571,6 +574,26 @@ export default function App() {
       const timer = setTimeout(() => { invoke("hide_main_window").catch(() => {}); }, 500);
       return () => clearTimeout(timer);
     }
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // ── Open at login (autostart) ────────────────────────────────────────────
+  useEffect(() => {
+    if (!isTauri()) return;
+    if (preferences.openAtLogin) {
+      autostartEnable().catch(() => {});
+    } else {
+      autostartDisable().catch(() => {});
+    }
+  }, [preferences.openAtLogin]);
+
+  // On first mount, sync the toggle to the actual OS state
+  useEffect(() => {
+    if (!isTauri()) return;
+    autostartIsEnabled().then(enabled => {
+      if (enabled !== preferences.openAtLogin) {
+        updatePref("openAtLogin", enabled);
+      }
+    }).catch(() => {});
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   // ── Tray event ───────────────────────────────────────────────────────────
@@ -1412,6 +1435,7 @@ export default function App() {
                     <div className="pref-section-title">Capture</div>
                     <label className="pref-toggle"><input type="checkbox" checked={preferences.hideWindowOnCapture} onChange={e => updatePref("hideWindowOnCapture", e.target.checked)} /><span>Hide Capturo while taking screenshot</span></label>
                     <label className="pref-toggle"><input type="checkbox" checked={preferences.hideAtLaunch} onChange={e => updatePref("hideAtLaunch", e.target.checked)} /><span>Always hide this window at launch</span></label>
+                    <label className="pref-toggle"><input type="checkbox" checked={preferences.openAtLogin} onChange={e => updatePref("openAtLogin", e.target.checked)} /><span>Open Capturo at login</span></label>
                     <label className="pref-toggle"><input type="checkbox" checked={preferences.soundEffects} onChange={e => updatePref("soundEffects", e.target.checked)} /><span>Enable sound effects</span></label>
                     <div className="pref-row">
                       <span>Capture delay</span>

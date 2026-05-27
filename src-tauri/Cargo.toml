@@ -32,4 +32,5 @@ base64 = "0.22.1"
 tokio = { version = "1.52.1", features = ["rt", "time"] }
 arboard = "3"
 xcap = "0.4"
+tauri-plugin-autostart = "2"
 

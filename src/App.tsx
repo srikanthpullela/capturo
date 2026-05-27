@@ -164,6 +164,38 @@ function loadPrefs(): Preferences {
   }
 }
 
+function parseHistoryItems(text: string | null): HistoryItem[] {
+  if (!text) return [];
+  try {
+    const parsed = JSON.parse(text);
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter((item): item is HistoryItem =>
+      item &&
+      typeof item.id === "string" &&
+      typeof item.timestamp === "number" &&
+      typeof item.croppedShot === "string" &&
+      item.bg &&
+      typeof item.padding === "number" &&
+      typeof item.radius === "number" &&
+      typeof item.shadow === "number"
+    );
+  } catch {
+    return [];
+  }
+}
+
+function mergeHistoryItems(...lists: HistoryItem[][]): HistoryItem[] {
+  const merged = new Map<string, HistoryItem>();
+  for (const list of lists) {
+    for (const item of list) {
+      if (!merged.has(item.id)) merged.set(item.id, item);
+    }
+  }
+  return Array.from(merged.values())
+    .sort((a, b) => b.timestamp - a.timestamp)
+    .slice(0, 40);
+}
+
 function makeFileName(template: string, ext: SaveFormat) {
   const d = new Date();
   const pad = (n: number) => String(n).padStart(2, "0");
@@ -228,7 +260,7 @@ export default function App() {
   const [activeTab, setActiveTab] = useState<AppTab>("editor");
   const [preferences, setPreferences] = useState<Preferences>(() => loadPrefs());
   const [history, setHistory]     = useState<HistoryItem[]>([]);
-  const historyLoadedRef = useRef(false);
+  const [historyLoaded, setHistoryLoaded] = useState(false);
   const [toast, setToast] = useState("");
   const [permissionHint, setPermissionHint] = useState(false);
   const [countdown, setCountdown] = useState<number | null>(null);
@@ -252,6 +284,7 @@ export default function App() {
   const toastTimer         = useRef<ReturnType<typeof setTimeout> | null>(null);
   const captureInProgress  = useRef(false);
   const compositeRef = useRef<() => void>(() => {});
+  const historyRef = useRef<HistoryItem[]>([]);
 
 
   // ── Toast ────────────────────────────────────────────────────────────────
@@ -260,6 +293,44 @@ export default function App() {
     if (toastTimer.current) clearTimeout(toastTimer.current);
     toastTimer.current = setTimeout(() => setToast(""), 2000);
   };
+
+  const persistHistory = useCallback((items: HistoryItem[], force = false) => {
+    if (!force && !preferences.saveHistory) return;
+    if (!isTauri()) {
+      try {
+        localStorage.setItem("capturo_history", JSON.stringify(items));
+      } catch (e) {
+        console.error("capturo_history localStorage save failed", e);
+        showToast("History save failed");
+      }
+      return;
+    }
+    invoke("save_history", { data: JSON.stringify(items) }).catch((e) => {
+      console.error("save_history failed", e);
+      showToast("History save failed");
+    });
+  }, [preferences.saveHistory]);
+
+  const replaceHistory = useCallback((items: HistoryItem[], forceSave = false) => {
+    historyRef.current = items;
+    setHistory(items);
+    persistHistory(items, forceSave);
+  }, [persistHistory]);
+
+  const addHistoryShot = useCallback((b64: string) => {
+    const timestamp = Date.now();
+    const next = mergeHistoryItems([{
+      id: timestamp.toString(),
+      timestamp,
+      croppedShot: b64,
+      bg: BACKGROUNDS.find(b => b.id === 'candy') ?? BACKGROUNDS[0],
+      padding: 48,
+      radius: 12,
+      shadow: 60,
+      blur: 0,
+    }], historyRef.current);
+    replaceHistory(next);
+  }, [replaceHistory]);
 
   const updatePref = <K extends keyof Preferences>(key: K, value: Preferences[K]) => {
     setPreferences(prev => ({ ...prev, [key]: value }));
@@ -632,44 +703,42 @@ export default function App() {
 
   // ── Load history from disk on mount (no localStorage 5MB quota) ──────────
   useEffect(() => {
+    historyRef.current = history;
+  }, [history]);
+
+  useEffect(() => {
     if (!isTauri()) {
       try {
-        const saved = localStorage.getItem("capturo_history");
-        const parsed = saved ? JSON.parse(saved) : [];
-        if (Array.isArray(parsed)) setHistory(parsed);
+        const parsed = parseHistoryItems(localStorage.getItem("capturo_history"));
+        historyRef.current = parsed;
+        if (parsed.length > 0) setHistory(parsed);
       } catch {}
-      historyLoadedRef.current = true;
+      setHistoryLoaded(true);
       return;
     }
     (async () => {
+      let diskHistory: HistoryItem[] = [];
+      let browserHistory: HistoryItem[] = [];
       try {
         const text = await invoke<string>("load_history");
-        const parsed = JSON.parse(text);
-        if (Array.isArray(parsed)) setHistory(parsed);
-      } catch {
-        // File missing on first run — migrate from localStorage if anything is there
-        try {
-          const saved = localStorage.getItem("capturo_history");
-          if (saved) {
-            const parsed = JSON.parse(saved);
-            if (Array.isArray(parsed) && parsed.length > 0) setHistory(parsed);
-          }
-        } catch {}
+        diskHistory = parseHistoryItems(text);
+      } catch (e) {
+        console.info("load_history skipped", e);
       }
-      historyLoadedRef.current = true;
+      browserHistory = parseHistoryItems(localStorage.getItem("capturo_history"));
+      const merged = mergeHistoryItems(diskHistory, browserHistory);
+      historyRef.current = merged;
+      setHistory(merged);
+      setHistoryLoaded(true);
+      persistHistory(merged, true);
     })();
-  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [persistHistory]);
 
   // ── History persistence ───────────────────────────────────────────────────
   useEffect(() => {
-    if (!historyLoadedRef.current) return;
-    if (!preferences.saveHistory) return;
-    if (!isTauri()) {
-      try { localStorage.setItem("capturo_history", JSON.stringify(history)); } catch {}
-      return;
-    }
-    invoke("save_history", { data: JSON.stringify(history) }).catch(() => {});
-  }, [history, preferences.saveHistory]);
+    if (!historyLoaded) return;
+    persistHistory(history);
+  }, [history, historyLoaded, persistHistory]);
 
   // ── Repaint canvas + cursor fix when window becomes visible ───────────────
   useEffect(() => {
@@ -720,10 +789,7 @@ export default function App() {
       setMode("idle");
       setActiveTab("editor");
       if (preferences.saveHistory) {
-        setHistory(prev => [{
-          id: Date.now().toString(), timestamp: Date.now(),
-            croppedShot: b64, bg: BACKGROUNDS.find(b => b.id === 'candy') ?? BACKGROUNDS[0], padding: 48, radius: 12, shadow: 60, blur: 0,
-        }, ...prev].slice(0, 40));
+        addHistoryShot(b64);
       }
       if (preferences.autoSavePath && isTauri()) {
         const fname = makeFileName(preferences.defaultFileName, preferences.saveFormat);
@@ -756,10 +822,7 @@ export default function App() {
     setMode('idle');
     setActiveTab('editor');
     if (preferences.saveHistory) {
-      setHistory(prev => [{
-        id: Date.now().toString(), timestamp: Date.now(),
-        croppedShot: b64, bg: BACKGROUNDS.find(b => b.id === 'candy') ?? BACKGROUNDS[0], padding: 48, radius: 12, shadow: 60, blur: 0,
-      }, ...prev].slice(0, 40));
+      addHistoryShot(b64);
     }
     if (preferences.autoSavePath && isTauri()) {
       const fname = makeFileName(preferences.defaultFileName, preferences.saveFormat);
@@ -920,7 +983,7 @@ export default function App() {
 
   const deleteFromHistory = (id: string, e: React.MouseEvent) => {
     e.stopPropagation();
-    setHistory(prev => prev.filter(h => h.id !== id));
+    replaceHistory(historyRef.current.filter(h => h.id !== id), true);
   };
 
   const prewriteTempFile = async (item: HistoryItem) => {
@@ -1045,10 +1108,7 @@ export default function App() {
       setMode("idle");
       setActiveTab("editor");
       if (preferences.saveHistory) {
-        setHistory(prev => [{
-          id: Date.now().toString(), timestamp: Date.now(),
-          croppedShot: b64, bg: BACKGROUNDS.find(b => b.id === 'candy') ?? BACKGROUNDS[0], padding: 48, radius: 12, shadow: 60, blur: 0,
-        }, ...prev].slice(0, 40));
+        addHistoryShot(b64);
       }
       if (preferences.autoSavePath && isTauri()) {
         const fname = makeFileName(preferences.defaultFileName, preferences.saveFormat);
@@ -1514,7 +1574,7 @@ export default function App() {
                     <label className="pref-toggle"><input type="checkbox" checked={preferences.saveHistory} onChange={e => updatePref("saveHistory", e.target.checked)} /><span>Save screenshot history</span></label>
                     <div className="pref-row">
                       <span>{history.length} screenshots stored</span>
-                      <button className="btn btn-ghost" onClick={() => setHistory([])}>Clear History</button>
+                      <button className="btn btn-ghost" onClick={() => replaceHistory([], true)}>Clear History</button>
                     </div>
                   </section>
                 </div>

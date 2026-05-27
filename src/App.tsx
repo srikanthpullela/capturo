@@ -9,7 +9,8 @@ function isTauri(): boolean {
 }
 import { save, open as openDialog } from "@tauri-apps/plugin-dialog";
 import { enable as autostartEnable, disable as autostartDisable, isEnabled as autostartIsEnabled } from "@tauri-apps/plugin-autostart";
-import { writeFile } from "@tauri-apps/plugin-fs";
+import { writeFile, writeTextFile, readTextFile, mkdir } from "@tauri-apps/plugin-fs";
+import { appLocalDataDir } from "@tauri-apps/api/path";
 import "./App.css";
 
 // ── Types ──────────────────────────────────────────────────────────────────
@@ -227,15 +228,8 @@ export default function App() {
 
   const [activeTab, setActiveTab] = useState<AppTab>("editor");
   const [preferences, setPreferences] = useState<Preferences>(() => loadPrefs());
-  const [history, setHistory]     = useState<HistoryItem[]>(() => {
-    try {
-      const saved = localStorage.getItem("capturo_history");
-      const parsed = saved ? JSON.parse(saved) : [];
-      return Array.isArray(parsed) ? parsed : [];
-    } catch {
-      return [];
-    }
-  });
+  const [history, setHistory]     = useState<HistoryItem[]>([]);
+  const historyLoadedRef = useRef(false);
   const [toast, setToast] = useState("");
   const [permissionHint, setPermissionHint] = useState(false);
   const [countdown, setCountdown] = useState<number | null>(null);
@@ -637,10 +631,52 @@ export default function App() {
     return () => window.removeEventListener("keydown", onKey);
   }, []);
 
+  // ── Load history from disk on mount (no localStorage 5MB quota) ──────────
+  useEffect(() => {
+    if (!isTauri()) {
+      try {
+        const saved = localStorage.getItem("capturo_history");
+        const parsed = saved ? JSON.parse(saved) : [];
+        if (Array.isArray(parsed)) setHistory(parsed);
+      } catch {}
+      historyLoadedRef.current = true;
+      return;
+    }
+    (async () => {
+      try {
+        const dir = await appLocalDataDir();
+        const text = await readTextFile(`${dir}/capturo_history.json`);
+        const parsed = JSON.parse(text);
+        if (Array.isArray(parsed)) setHistory(parsed);
+      } catch {
+        // File missing on first run — migrate from localStorage if anything is there
+        try {
+          const saved = localStorage.getItem("capturo_history");
+          if (saved) {
+            const parsed = JSON.parse(saved);
+            if (Array.isArray(parsed) && parsed.length > 0) setHistory(parsed);
+          }
+        } catch {}
+      }
+      historyLoadedRef.current = true;
+    })();
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
   // ── History persistence ───────────────────────────────────────────────────
   useEffect(() => {
+    if (!historyLoadedRef.current) return;
     if (!preferences.saveHistory) return;
-    try { localStorage.setItem("capturo_history", JSON.stringify(history)); } catch {}
+    if (!isTauri()) {
+      try { localStorage.setItem("capturo_history", JSON.stringify(history)); } catch {}
+      return;
+    }
+    (async () => {
+      try {
+        const dir = await appLocalDataDir();
+        await mkdir(dir, { recursive: true });
+        await writeTextFile(`${dir}/capturo_history.json`, JSON.stringify(history));
+      } catch {}
+    })();
   }, [history, preferences.saveHistory]);
 
   // ── Repaint canvas + cursor fix when window becomes visible ───────────────

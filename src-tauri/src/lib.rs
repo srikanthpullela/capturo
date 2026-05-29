@@ -201,6 +201,19 @@ mod commands {
         Ok(path)
     }
 
+    /// Read any image file from disk and return it as a base64-encoded PNG string.
+    /// Used when the user drops an external image onto the app.
+    #[tauri::command]
+    pub fn read_image_as_base64(path: String) -> Result<String, String> {
+        let bytes = std::fs::read(&path).map_err(|e| format!("read: {e}"))?;
+        // Validate it's a recognised image format
+        let img = image::load_from_memory(&bytes).map_err(|e| format!("not a valid image: {e}"))?;
+        // Re-encode as PNG so the front-end always gets PNG base64
+        let mut buf = Cursor::new(Vec::new());
+        img.write_to(&mut buf, ImageFormat::Png).map_err(|e| format!("encode: {e}"))?;
+        Ok(general_purpose::STANDARD.encode(buf.into_inner()))
+    }
+
     /// Quick-save a base64 PNG to ~/Downloads/Capturo-<timestamp>.png
     #[tauri::command]
     pub fn save_to_downloads(base64_png: String, file_extension: Option<String>, filename_template: Option<String>) -> Result<String, String> {
@@ -486,6 +499,7 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(tauri_plugin_autostart::init(tauri_plugin_autostart::MacosLauncher::LaunchAgent, None))
+        .plugin(tauri_plugin_drag::init())
         .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
             reveal_main_window(app);
         }))
@@ -554,6 +568,7 @@ pub fn run() {
             commands::crop_image,
             commands::save_image,
             commands::write_temp_image,
+            commands::read_image_as_base64,
             commands::copy_image_to_clipboard,
             commands::save_to_downloads,
             commands::open_screen_permission_settings,

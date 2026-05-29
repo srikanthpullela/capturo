@@ -101,8 +101,12 @@ html, body, #root { height: 100%; overflow: hidden; background: var(--c-bg); col
 }
 
 .canvas-wrap {
-  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  display: flex; flex-direction: column; align-items: center; justify-content: flex-start;
   width: 100%; height: 100%; overflow: hidden; padding: 4px 8px 8px;
+}
+.canvas-center {
+  flex: 1; display: flex; align-items: center; justify-content: center;
+  width: 100%; min-height: 0;
 }
 
 /* Canvas stack: screenshot canvas + annotation canvas overlaid */
@@ -455,10 +459,144 @@ html, body, #root { height: 100%; overflow: hidden; background: var(--c-bg); col
 
 /* ── History Panel ───────────────────────────────────────────────── */
 .history-panel {
-  flex: 1; overflow-y: auto; padding: 24px;
+  flex: 1; display: flex; flex-direction: row; overflow: hidden;
+  background: var(--c-bg);
+}
+
+/* ── Folder sidebar ── */
+.history-folders-pane {
+  width: 168px; flex-shrink: 0; display: flex; flex-direction: column;
+  padding: 16px 8px; gap: 2px;
+  border-right: 1px solid var(--c-border);
+  background: var(--c-surf);
+  overflow-y: auto;
+}
+.history-folders-title {
+  font-size: 10px; font-weight: 700; text-transform: uppercase;
+  letter-spacing: 0.08em; color: var(--c-muted);
+  padding: 0 8px 8px; flex-shrink: 0;
+}
+.history-folder-item {
+  display: flex; align-items: center; gap: 6px; padding: 6px 8px;
+  border-radius: var(--r-sm); cursor: pointer; font-size: 12px;
+  color: var(--c-muted); transition: background 0.12s, color 0.12s;
+  border: 1.5px solid transparent; position: relative; user-select: none;
+}
+.history-folder-item:hover { background: var(--c-surf2); color: var(--c-text); }
+.history-folder-item--active { background: rgba(99,102,241,0.12); color: var(--c-text); border-color: rgba(99,102,241,0.3); }
+.history-folder-item--dragover { border-color: var(--c-accent) !important; background: rgba(99,102,241,0.22) !important; color: var(--c-text); }
+.history-folder-icon { flex-shrink: 0; opacity: 0.7; display: flex; align-items: center; }
+.history-folder-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.history-folder-count {
+  font-size: 10px; background: rgba(255,255,255,0.08); padding: 1px 5px;
+  border-radius: 10px; flex-shrink: 0; min-width: 16px; text-align: center;
+}
+.history-folder-del {
+  display: none; width: 16px; height: 16px; border: none; background: none;
+  color: var(--c-muted); cursor: pointer; font-size: 14px; padding: 0;
+  align-items: center; justify-content: center; flex-shrink: 0; border-radius: 3px;
+  line-height: 1;
+}
+.history-folder-item:hover .history-folder-del { display: flex; }
+.history-folder-del:hover { color: #f87171; background: rgba(248,113,113,0.12); }
+.history-folder-new {
+  margin-top: 6px; width: 100%; padding: 6px 8px; background: none;
+  border: 1.5px dashed var(--c-border); border-radius: var(--r-sm);
+  color: var(--c-muted); font-size: 12px; cursor: pointer; text-align: left;
+  transition: all 0.12s; flex-shrink: 0;
+}
+.history-folder-new:hover { border-color: var(--c-accent); color: var(--c-text); background: rgba(99,102,241,0.06); }
+.history-folder-new-input, .history-folder-rename-input {
+  width: 100%; padding: 5px 8px; background: var(--c-surf3);
+  border: 1.5px solid var(--c-accent); border-radius: var(--r-sm);
+  color: var(--c-text); font-size: 12px; outline: none; box-sizing: border-box;
+}
+/* ── History main area ── */
+.history-main {
+  flex: 1; overflow-y: auto; padding: 20px;
   background: var(--c-bg);
   background-image: radial-gradient(ellipse 60% 40% at 50% 0%, rgba(99,102,241,0.05) 0%, transparent 100%);
 }
+/* ── Folder badge on card ── */
+.history-folder-badge {
+  position: absolute; bottom: 4px; left: 4px; font-size: 9px;
+  background: rgba(99,102,241,0.65); color: #fff; padding: 1px 5px;
+  border-radius: 6px; max-width: 80px; overflow: hidden; text-overflow: ellipsis;
+  white-space: nowrap; pointer-events: none; backdrop-filter: blur(4px);
+}
+/* ── Dragging card dim ── */
+.history-card--dragging { opacity: 0.45; }
+
+/* ── Drag ghost: floating screenshot thumbnail following the cursor ── */
+@keyframes ghostFadeIn {
+  from { opacity: 0; }
+  to   { opacity: 0.93; }
+}
+.history-drag-ghost {
+  position: fixed;
+  left: 0;
+  top: 0;
+  z-index: 10000;
+  pointer-events: none;
+  width: 128px;
+  border-radius: 10px;
+  overflow: hidden;
+  box-shadow: 0 20px 60px rgba(0,0,0,0.6), 0 0 0 2.5px rgba(99,102,241,0.7);
+  will-change: transform;
+  transform: translate(0,0) rotate(2.5deg) scale(1.06);
+  animation: ghostFadeIn 0.12s ease forwards;
+}
+.history-drag-ghost img {
+  width: 100%;
+  display: block;
+  object-fit: cover;
+}
+/* ── External drag-over overlay ── */
+.workspace--drag-over {
+  position: relative;
+}
+.workspace--drag-over::after {
+  content: "Drop image to open";
+  position: absolute;
+  inset: 0;
+  z-index: 9000;
+  border: 2px dashed var(--c-accent, #6366f1);
+  border-radius: var(--r-lg, 12px);
+  background: rgba(99, 102, 241, 0.08);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--c-accent, #6366f1);
+  letter-spacing: 0.01em;
+  pointer-events: none;
+  backdrop-filter: blur(2px);
+  animation: dragOverFadeIn 0.15s ease forwards;
+}
+@keyframes dragOverFadeIn {
+  from { opacity: 0; }
+  to   { opacity: 1; }
+}
+
+/* ── Context menu ── */
+.history-context-menu {
+  position: fixed; z-index: 9999; min-width: 186px;
+  background: var(--c-surf); border: 1px solid var(--c-border2);
+  border-radius: var(--r-lg); box-shadow: 0 8px 32px rgba(0,0,0,0.45);
+  padding: 4px; backdrop-filter: blur(12px);
+}
+.ctx-item {
+  display: block; width: 100%; padding: 7px 12px; background: none;
+  border: none; color: var(--c-text); font-size: 12px; text-align: left;
+  cursor: pointer; border-radius: var(--r-sm); transition: background 0.1s;
+}
+.ctx-item:hover { background: var(--c-surf2); }
+.ctx-item--danger { color: #f87171; }
+.ctx-item--danger:hover { background: rgba(248,113,113,0.12); }
+.ctx-item--disabled { color: var(--c-muted); cursor: default; font-style: italic; }
+.ctx-item--disabled:hover { background: none; }
+.ctx-sep { height: 1px; background: var(--c-border); margin: 4px 2px; }
 
 .history-empty {
   display: flex; flex-direction: column; align-items: center;

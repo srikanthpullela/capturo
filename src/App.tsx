@@ -1,7 +1,8 @@
-import React, { useEffect, useRef, useState, useCallback } from "react";
+import React, { useEffect, useRef, useState, useCallback, useMemo } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { register, unregisterAll } from "@tauri-apps/plugin-global-shortcut";
 import { listen } from "@tauri-apps/api/event";
+import { getCurrentWebview } from "@tauri-apps/api/webview";
 
 function isTauri(): boolean {
   return typeof window !== "undefined" &&
@@ -10,6 +11,7 @@ function isTauri(): boolean {
 import { save, open as openDialog } from "@tauri-apps/plugin-dialog";
 import { enable as autostartEnable, disable as autostartDisable, isEnabled as autostartIsEnabled } from "@tauri-apps/plugin-autostart";
 import { writeFile } from "@tauri-apps/plugin-fs";
+import { startDrag } from "@crabnebula/tauri-plugin-drag";
 import "./App.css";
 
 // ── Types ──────────────────────────────────────────────────────────────────
@@ -57,6 +59,13 @@ interface HistoryItem {
   radius: number;
   shadow: number;
   blur: number;
+  folderId?: string;
+}
+
+interface Folder {
+  id: string;
+  name: string;
+  createdAt: number;
 }
 
 function formatTime(ts: number): string {
@@ -164,6 +173,17 @@ function loadPrefs(): Preferences {
   }
 }
 
+function loadFolders(): Folder[] {
+  try {
+    const s = localStorage.getItem("capturo_folders");
+    return s ? JSON.parse(s) : [];
+  } catch { return []; }
+}
+
+function saveFolders(flds: Folder[]) {
+  localStorage.setItem("capturo_folders", JSON.stringify(flds));
+}
+
 function parseHistoryItems(text: string | null): HistoryItem[] {
   if (!text) return [];
   try {
@@ -210,6 +230,22 @@ function makeFileName(template: string, ext: SaveFormat) {
   return `${base}.${ext}`;
 }
 
+
+
+async function makeDragIcon(base64Png: string, id: string): Promise<string> {
+  const img = new Image();
+  await new Promise<void>((res, rej) => { img.onload = () => res(); img.onerror = () => rej(); img.src = `data:image/png;base64,${base64Png}`; });
+  const MAX = 192;
+  const scale = Math.min(MAX / img.naturalWidth, MAX / img.naturalHeight, 1);
+  const w = Math.max(1, Math.round(img.naturalWidth * scale));
+  const h = Math.max(1, Math.round(img.naturalHeight * scale));
+  const c = document.createElement('canvas');
+  c.width = w; c.height = h;
+  c.getContext('2d')!.drawImage(img, 0, 0, w, h);
+  const smallB64 = c.toDataURL('image/png').split(',')[1];
+  return invoke<string>('write_temp_image', { id: `${id}_icon`, base64Png: smallB64 });
+}
+
 function drawArrow(ctx: CanvasRenderingContext2D, x1: number, y1: number, x2: number, y2: number, lw: number) {
   const headLen = Math.max(14, lw * 4);
   const angle = Math.atan2(y2 - y1, x2 - x1);
@@ -238,6 +274,25 @@ function hitAnnotation(ann: Annotation, x: number, y: number): boolean {
 const PEN_CURSOR = `url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='20' height='20' viewBox='0 0 20 20'%3E%3Cpath d='M3 16.5l2.5-.8L17 5 15 3 3.5 14 3 16.5z' fill='white' stroke='%23333' stroke-width='1.2' stroke-linejoin='round'/%3E%3Cpath d='M15 3l2 2' stroke='%23333' stroke-width='1.2' stroke-linecap='round'/%3E%3C/svg%3E") 2 18, crosshair`;
 const ERASER_CURSOR = `url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='22' height='22' viewBox='0 0 22 22'%3E%3Crect x='2' y='10' width='18' height='10' rx='2' fill='%23fff' stroke='%23555' stroke-width='1.4'/%3E%3Cpath d='M2 15h18' stroke='%23ccc' stroke-width='1'/%3E%3C/svg%3E") 9 15, crosshair`;
 
+// ── NewFolderInput — isolated so the main App doesn't re-render on typing ──
+function NewFolderInput({ onCommit, onCancel }: { onCommit: (name: string) => void; onCancel: () => void }) {
+  const [val, setVal] = useState("");
+  return (
+    <input
+      autoFocus
+      className="history-folder-new-input"
+      placeholder="Folder name…"
+      value={val}
+      onChange={e => setVal(e.target.value)}
+      onBlur={() => { onCommit(val); }}
+      onKeyDown={e => {
+        if (e.key === "Enter") onCommit(val);
+        if (e.key === "Escape") onCancel();
+      }}
+    />
+  );
+}
+
 // ── Main Component ─────────────────────────────────────────────────────────
 export default function App() {
   const [mode, setMode]               = useState<AppMode>("idle");
@@ -261,6 +316,12 @@ export default function App() {
   const [preferences, setPreferences] = useState<Preferences>(() => loadPrefs());
   const [history, setHistory]     = useState<HistoryItem[]>([]);
   const [historyLoaded, setHistoryLoaded] = useState(false);
+  const [folders, setFolders] = useState<Folder[]>(() => loadFolders());
+  const [activeFolderId, setActiveFolderId] = useState<string | null>(null);
+  const [dragOverFolderId, setDragOverFolderId] = useState<string | null>(null);
+  const [contextMenu, setContextMenu] = useState<{ x: number; y: number; item: HistoryItem } | null>(null);
+  const [renamingFolderId, setRenamingFolderId] = useState<string | null>(null);
+  const [newFolderMode, setNewFolderMode] = useState(false);
   const [toast, setToast] = useState("");
   const [permissionHint, setPermissionHint] = useState(false);
   const [countdown, setCountdown] = useState<number | null>(null);
@@ -285,6 +346,18 @@ export default function App() {
   const captureInProgress  = useRef(false);
   const compositeRef = useRef<() => void>(() => {});
   const historyRef = useRef<HistoryItem[]>([]);
+  const dragRef = useRef<{ item: HistoryItem; startX: number; startY: number; grabOffsetX: number; grabOffsetY: number; active: boolean } | null>(null);
+  const wasDraggingRef = useRef(false);
+  const dragGhostRef = useRef<HTMLDivElement>(null);
+  const [dragGhostSrc, setDragGhostSrc] = useState<string | null>(null);
+  const [externalDragOver, setExternalDragOver] = useState(false);
+
+  // ── Displayed history (filtered by active folder) ────────────────────────
+  const displayedHistory = useMemo(() =>
+    activeFolderId ? historyRef.current.filter(i => i.folderId === activeFolderId) : historyRef.current,
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [history, activeFolderId]
+  );
 
 
   // ── Toast ────────────────────────────────────────────────────────────────
@@ -689,6 +762,40 @@ export default function App() {
     return () => { unlisten?.(); };
   }, []);
 
+  // ── File drop from outside (Finder / other apps) ──────────────────────
+  useEffect(() => {
+    if (!isTauri()) return;
+    let unlisten: (() => void) | null = null;
+    getCurrentWebview().onDragDropEvent(async (event) => {
+      const payload = event.payload;
+      if (payload.type === "enter") {
+        // Only show overlay if the dragged files contain an image
+        const hasImage = payload.paths.some(p => /\.(png|jpg|jpeg|webp|gif|bmp)$/i.test(p));
+        if (hasImage) setExternalDragOver(true);
+      } else if (payload.type === "leave") {
+        setExternalDragOver(false);
+      } else if (payload.type === "drop") {
+        setExternalDragOver(false);
+        const imagePaths = payload.paths.filter(p => /\.(png|jpg|jpeg|webp|gif|bmp)$/i.test(p));
+        if (imagePaths.length === 0) return;
+        const firstPath = imagePaths[0];
+        // Skip our own temp drag files (user dragged a history card outside)
+        if (firstPath.startsWith("/tmp/capturo_drag_")) return;
+        try {
+          const b64 = await invoke<string>("read_image_as_base64", { path: firstPath });
+          setCroppedShot(b64);
+          setAnnotations([]);
+          setAnnTool(null);
+          setActiveTab("editor");
+        } catch (err) {
+          showToast(`Could not open image: ${err}`);
+        }
+      }
+    }).then(fn => { unlisten = fn; });
+    return () => { unlisten?.(); };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   // ── Undo keyboard shortcut ───────────────────────────────────────────────
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -718,19 +825,27 @@ export default function App() {
     }
     (async () => {
       let diskHistory: HistoryItem[] = [];
+      let diskLoadOk = false;
       let browserHistory: HistoryItem[] = [];
       try {
         const text = await invoke<string>("load_history");
         diskHistory = parseHistoryItems(text);
+        diskLoadOk = true;
       } catch (e) {
-        console.info("load_history skipped", e);
+        console.error("load_history failed — keeping disk file unchanged", e);
       }
+      // Merge current localStorage key + legacy "snapcraft_history" key
+      const legacyHistory = parseHistoryItems(localStorage.getItem("snapcraft_history"));
       browserHistory = parseHistoryItems(localStorage.getItem("capturo_history"));
-      const merged = mergeHistoryItems(diskHistory, browserHistory);
+      const merged = mergeHistoryItems(diskHistory, browserHistory, legacyHistory);
       historyRef.current = merged;
       setHistory(merged);
       setHistoryLoaded(true);
-      persistHistory(merged, true);
+      // CRITICAL: only overwrite disk if we successfully loaded from it.
+      // Overwriting on a failed load would destroy items already on disk.
+      if (diskLoadOk) {
+        persistHistory(merged, true);
+      }
     })();
   }, [persistHistory]);
 
@@ -986,6 +1101,113 @@ export default function App() {
     replaceHistory(historyRef.current.filter(h => h.id !== id), true);
   };
 
+  // ── Folder management ──────────────────────────────────────────────────
+  const createFolder = (name: string) => {
+    const f: Folder = { id: Date.now().toString(), name: name.trim(), createdAt: Date.now() };
+    const next = [...folders, f];
+    setFolders(next); saveFolders(next);
+  };
+  const deleteFolder = (fid: string) => {
+    const updatedItems = historyRef.current.map(item =>
+      item.folderId === fid ? { ...item, folderId: undefined } : item
+    );
+    replaceHistory(updatedItems, true);
+    const next = folders.filter(f => f.id !== fid);
+    setFolders(next); saveFolders(next);
+    if (activeFolderId === fid) setActiveFolderId(null);
+  };
+  const renameFolder = (fid: string, name: string) => {
+    if (!name.trim()) return;
+    const next = folders.map(f => f.id === fid ? { ...f, name: name.trim() } : f);
+    setFolders(next); saveFolders(next);
+  };
+  const moveItemToFolder = (itemId: string, folderId: string | null) => {
+    const updatedItems = historyRef.current.map(item =>
+      item.id === itemId ? { ...item, folderId: folderId ?? undefined } : item
+    );
+    replaceHistory(updatedItems, true);
+  };
+
+  // ── History card drag (whole card → folder drop or OS drag) ───────────────
+  const handleCardPointerDown = (e: React.PointerEvent, item: HistoryItem) => {
+    if (e.button !== 0) return;
+    // Don't intercept clicks on interactive children (delete, copy buttons)
+    if ((e.target as HTMLElement).closest('button')) return;
+    const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
+    (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+    dragRef.current = {
+      item, startX: e.clientX, startY: e.clientY,
+      grabOffsetX: e.clientX - rect.left,
+      grabOffsetY: e.clientY - rect.top,
+      active: false,
+    };
+  };
+  const handleCardPointerMove = (e: React.PointerEvent) => {
+    const drag = dragRef.current;
+    if (!drag || !e.buttons) return;
+    const dx = e.clientX - drag.startX, dy = e.clientY - drag.startY;
+    if (Math.sqrt(dx * dx + dy * dy) < 6) return;
+    // If pointer has left the app window, trigger native OS drag
+    if (e.clientX < 0 || e.clientX > window.innerWidth || e.clientY < 0 || e.clientY > window.innerHeight) {
+      // Release pointer capture FIRST — prevents the browser from firing a synthetic
+      // pointerup/click on this card when the OS drag session ends, which was
+      // causing the editor to open when the user returned to the window.
+      (e.currentTarget as HTMLElement).releasePointerCapture(e.pointerId);
+      dragRef.current = null;
+      setDragOverFolderId(null);
+      if (dragGhostRef.current) { dragGhostRef.current.style.opacity = '0'; }
+      setTimeout(() => setDragGhostSrc(null), 150);
+      wasDraggingRef.current = true;
+      handleHistoryDragStart(drag.item).finally(() => {
+        // Small extra buffer so the pointerup/click that follows drop doesn't fire edit mode
+        setTimeout(() => { wasDraggingRef.current = false; }, 300);
+      });
+      return;
+    }
+    // Mount ghost once via state (no re-render per move after that)
+    if (!drag.active) {
+      setDragGhostSrc(drag.item.croppedShot);
+    }
+    drag.active = true;
+    // Update ghost position directly on the DOM element — zero React overhead
+    if (dragGhostRef.current) {
+      const gx = e.clientX - drag.grabOffsetX;
+      const gy = e.clientY - drag.grabOffsetY;
+      dragGhostRef.current.style.transform = `translate(${gx}px, ${gy}px) rotate(2.5deg) scale(1.06)`;
+    }
+    // Track which folder the pointer is over
+    const el = document.elementFromPoint(e.clientX, e.clientY);
+    const folderEl = (el as HTMLElement | null)?.closest?.('[data-folder-id]') as HTMLElement | null;
+    const newFolderId = folderEl?.dataset.folderId ?? null;
+    setDragOverFolderId(prev => prev === newFolderId ? prev : newFolderId);
+  };
+  const handleCardPointerUp = (_e: React.PointerEvent) => {
+    const drag = dragRef.current;
+    dragRef.current = null;
+    // Smooth fade-out on drop
+    if (dragGhostRef.current) {
+      const ghost = dragGhostRef.current;
+      ghost.style.transition = 'opacity 0.14s ease, transform 0.14s ease';
+      ghost.style.opacity = '0';
+      ghost.style.transform = ghost.style.transform.replace('scale(1.06)', 'scale(0.88)');
+    }
+    setTimeout(() => setDragGhostSrc(null), 160);
+    if (!drag?.active) { setDragOverFolderId(null); return; }
+    // Prevent the subsequent click event from opening edit mode
+    wasDraggingRef.current = true;
+    setTimeout(() => { wasDraggingRef.current = false; }, 200);
+    if (dragOverFolderId && dragOverFolderId !== '__all__') {
+      moveItemToFolder(drag.item.id, dragOverFolderId);
+    } else if (dragOverFolderId === '__all__') {
+      moveItemToFolder(drag.item.id, null);
+    }
+    setDragOverFolderId(null);
+  };
+  const handleCardContextMenu = (e: React.MouseEvent, item: HistoryItem) => {
+    e.preventDefault();
+    setContextMenu({ x: e.clientX, y: e.clientY, item });
+  };
+
   const prewriteTempFile = async (item: HistoryItem) => {
     const key = String(item.id);
     if (tempFileCache.current.has(key)) return;
@@ -1010,27 +1232,36 @@ export default function App() {
     } catch {}
   };
 
-  const handleEditorDragStart = (e: React.DragEvent) => {
-    const path = editorDragPath.current;
-    if (path) {
-      e.dataTransfer.effectAllowed = 'copy';
-      e.dataTransfer.setData('text/uri-list', `file://${path}`);
-      e.dataTransfer.setData('text/plain', `file://${path}`);
-    } else {
-      e.preventDefault();
+  const handleEditorDragStart = async () => {
+    if (!isTauri()) return;
+    const canvas = getFlatCanvas();
+    if (!canvas) return;
+    const b64 = canvas.toDataURL("image/png").split(",")[1];
+    let path = editorDragPath.current;
+    if (!path) {
+      try {
+        path = await invoke<string>('write_temp_image', { id: 'editor_current', base64Png: b64 });
+        editorDragPath.current = path;
+      } catch { return; }
     }
+    let iconPath = path;
+    try { iconPath = await makeDragIcon(b64, 'editor_current'); } catch {}
+    try { await startDrag({ item: [path], icon: iconPath }); } catch {}
   };
 
-  const handleHistoryDragStart = (item: HistoryItem, e: React.DragEvent<HTMLDivElement>) => {
-    const path = tempFileCache.current.get(String(item.id));
-    if (path) {
-      e.dataTransfer.effectAllowed = 'copy';
-      e.dataTransfer.setData('text/uri-list', `file://${path}`);
-      e.dataTransfer.setData('text/plain', `file://${path}`);
-      e.stopPropagation();
-    } else {
-      e.preventDefault();
+  const handleHistoryDragStart = async (item: HistoryItem) => {
+    if (!isTauri()) return;
+    const key = String(item.id);
+    let path = tempFileCache.current.get(key);
+    if (!path) {
+      try {
+        path = await invoke<string>('write_temp_image', { id: key, base64Png: item.croppedShot });
+        tempFileCache.current.set(key, path);
+      } catch { return; }
     }
+    let iconPath = path;
+    try { iconPath = await makeDragIcon(item.croppedShot, key); } catch {}
+    try { await startDrag({ item: [path], icon: iconPath }); } catch {}
   };
 
   const copyHistoryItem = async (item: HistoryItem, e: React.MouseEvent) => {
@@ -1213,7 +1444,7 @@ export default function App() {
             </nav>
           </header>
 
-          <div className="workspace">
+          <div className={`workspace${externalDragOver ? " workspace--drag-over" : ""}`}>
 
             {/* ── EDITOR TAB ── */}
             {activeTab === "editor" && (
@@ -1307,6 +1538,7 @@ export default function App() {
                         </div>
                       </div>
 
+                      <div className="canvas-center">
                       <div className="canvas-stack">
                         <canvas ref={canvasRef} className="output-canvas" />
                         <canvas
@@ -1352,6 +1584,7 @@ export default function App() {
                             />
                           </>
                         )}
+                      </div>
                       </div>
                     </div>
                   ) : (
@@ -1448,9 +1681,8 @@ export default function App() {
                     </button>
                     <div
                       className="editor-footer-btn editor-footer-drag"
-                      draggable
-                      onDragStart={handleEditorDragStart}
                       onMouseEnter={prewriteEditorTempFile}
+                      onPointerDown={handleEditorDragStart}
                       title="Drag to Finder / folder"
                     >
                       <svg width="15" height="15" viewBox="0 0 15 15" fill="none">
@@ -1467,41 +1699,149 @@ export default function App() {
 
             {/* ── HISTORY TAB ── */}
             {activeTab === "history" && (
-              <div className="history-panel">
-                {history.length === 0 ? (
-                  <div className="history-empty">
-                    <div className="history-empty-icon">
-                      <svg width="48" height="48" viewBox="0 0 48 48" fill="none">
-                        <rect width="48" height="48" rx="14" fill="rgba(99,102,241,0.10)"/>
-                        <path d="M24 14v10l6 4" stroke="#6366f1" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round"/>
-                        <circle cx="24" cy="24" r="10" stroke="#8b5cf6" strokeWidth="2"/>
-                      </svg>
-                    </div>
-                    <h3>No history yet</h3>
-                    <p>Captured screenshots will appear here.</p>
+              <div className="history-panel" onClick={() => { if (contextMenu) setContextMenu(null); }}>
+
+                {/* ── Left folder sidebar ── */}
+                <div className="history-folders-pane">
+                  <div className="history-folders-title">Folders</div>
+
+                  {/* "All" entry */}
+                  <div
+                    className={`history-folder-item${!activeFolderId ? " history-folder-item--active" : ""}${dragOverFolderId === "__all__" ? " history-folder-item--dragover" : ""}`}
+                    onClick={() => setActiveFolderId(null)}
+                    data-folder-id="__all__"
+                  >
+                    <span className="history-folder-icon">
+                      <svg width="13" height="13" viewBox="0 0 13 13" fill="none"><rect x="1" y="4" width="11" height="8" rx="1.5" stroke="currentColor" strokeWidth="1.3"/><path d="M1 6V4.5A1.5 1.5 0 0 1 2.5 3h2.1l1 1.5H11" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round"/></svg>
+                    </span>
+                    <span className="history-folder-name">All</span>
+                    <span className="history-folder-count">{history.length}</span>
                   </div>
-                ) : (
-                  <div className="history-grid">
-                    {history.map(item => (
-                      <div key={item.id} className="history-card" onClick={() => loadFromHistory(item)} title="Click to re-edit" onMouseEnter={() => prewriteTempFile(item)}>
-                        <div className="history-thumb-wrap" draggable onDragStart={(e) => handleHistoryDragStart(item, e)}>
-                          <img className="history-thumb" src={`data:image/png;base64,${item.croppedShot}`} alt="screenshot" />
-                          <button className="history-del" onClick={(e) => deleteFromHistory(item.id, e)} title="Delete screenshot">
-                            <svg width="9" height="9" viewBox="0 0 9 9" fill="none"><path d="M1 1l7 7M8 1L1 8" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round"/></svg>
-                          </button>
-                          <div className="history-drag-handle" title="Drag to Finder / folder">
-                            <svg width="11" height="11" viewBox="0 0 11 11" fill="none"><circle cx="3" cy="2.5" r="1" fill="currentColor"/><circle cx="8" cy="2.5" r="1" fill="currentColor"/><circle cx="3" cy="5.5" r="1" fill="currentColor"/><circle cx="8" cy="5.5" r="1" fill="currentColor"/><circle cx="3" cy="8.5" r="1" fill="currentColor"/><circle cx="8" cy="8.5" r="1" fill="currentColor"/></svg>
+
+                  {/* User folders */}
+                  {folders.map(folder => (
+                    <div
+                      key={folder.id}
+                      className={`history-folder-item${activeFolderId === folder.id ? " history-folder-item--active" : ""}${dragOverFolderId === folder.id ? " history-folder-item--dragover" : ""}`}
+                      onClick={() => setActiveFolderId(folder.id)}
+                      data-folder-id={folder.id}
+                    >
+                      {renamingFolderId === folder.id ? (
+                        <input
+                          autoFocus
+                          className="history-folder-rename-input"
+                          defaultValue={folder.name}
+                          onBlur={e => { renameFolder(folder.id, e.target.value); setRenamingFolderId(null); }}
+                          onKeyDown={e => {
+                            if (e.key === "Enter") { renameFolder(folder.id, e.currentTarget.value); setRenamingFolderId(null); }
+                            if (e.key === "Escape") setRenamingFolderId(null);
+                          }}
+                          onClick={e => e.stopPropagation()}
+                        />
+                      ) : (
+                        <>
+                          <span className="history-folder-icon">
+                            <svg width="13" height="13" viewBox="0 0 13 13" fill="none"><rect x="1" y="4" width="11" height="8" rx="1.5" stroke="currentColor" strokeWidth="1.3"/><path d="M1 6V4.5A1.5 1.5 0 0 1 2.5 3h2.1l1 1.5H11" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round"/></svg>
+                          </span>
+                          <span className="history-folder-name" onDoubleClick={e => { e.stopPropagation(); setRenamingFolderId(folder.id); }}>{folder.name}</span>
+                          <span className="history-folder-count">{history.filter(i => i.folderId === folder.id).length}</span>
+                          <button
+                            className="history-folder-del"
+                            onClick={e => { e.stopPropagation(); deleteFolder(folder.id); }}
+                            title="Delete folder"
+                          >×</button>
+                        </>
+                      )}
+                    </div>
+                  ))}
+
+                  {/* New folder */}
+                  {newFolderMode ? (
+                    <NewFolderInput
+                      onCommit={name => { if (name.trim()) createFolder(name); setNewFolderMode(false); }}
+                      onCancel={() => setNewFolderMode(false)}
+                    />
+                  ) : (
+                    <button className="history-folder-new" onClick={() => setNewFolderMode(true)}>+ New Folder</button>
+                  )}
+                </div>
+
+                {/* ── Main history grid ── */}
+                <div className="history-main">
+                  {displayedHistory.length === 0 ? (
+                    <div className="history-empty">
+                      <div className="history-empty-icon">
+                        <svg width="48" height="48" viewBox="0 0 48 48" fill="none">
+                          <rect width="48" height="48" rx="14" fill="rgba(99,102,241,0.10)"/>
+                          <path d="M24 14v10l6 4" stroke="#6366f1" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round"/>
+                          <circle cx="24" cy="24" r="10" stroke="#8b5cf6" strokeWidth="2"/>
+                        </svg>
+                      </div>
+                      <h3>{activeFolderId ? "Folder is empty" : "No history yet"}</h3>
+                      <p>{activeFolderId ? "Drag screenshots here or right-click a card to move." : "Captured screenshots will appear here."}</p>
+                    </div>
+                  ) : (
+                    <div className="history-grid">
+                      {displayedHistory.map(item => (
+                        <div
+                          key={item.id}
+                          className={`history-card${dragRef.current?.item.id === item.id && dragRef.current.active ? " history-card--dragging" : ""}`}
+                          onClick={() => { if (!wasDraggingRef.current) loadFromHistory(item); }}
+                          onPointerDown={e => { prewriteTempFile(item); handleCardPointerDown(e, item); }}
+                          onPointerMove={handleCardPointerMove}
+                          onPointerUp={handleCardPointerUp}
+                          onContextMenu={e => handleCardContextMenu(e, item)}
+                          onMouseEnter={() => prewriteTempFile(item)}
+                          title="Click to re-edit · Drag to folder or outside to Finder · Right-click for options"
+                        >
+                          <div className="history-thumb-wrap">
+                            <img className="history-thumb" src={`data:image/png;base64,${item.croppedShot}`} alt="screenshot" draggable={false} />
+                            <button className="history-del" onClick={(e) => deleteFromHistory(item.id, e)} title="Delete screenshot">
+                              <svg width="9" height="9" viewBox="0 0 9 9" fill="none"><path d="M1 1l7 7M8 1L1 8" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round"/></svg>
+                            </button>
+                            {item.folderId && (
+                              <span className="history-folder-badge">{folders.find(f => f.id === item.folderId)?.name}</span>
+                            )}
+                          </div>
+                          <div className="history-card-footer">
+                            <span className="history-time">{formatTime(item.timestamp)}</span>
+                            <button className="history-copy" onClick={(e) => copyHistoryItem(item, e)} title="Copy image to clipboard">
+                              <svg width="12" height="12" viewBox="0 0 12 12" fill="none"><rect x="4" y="4" width="7" height="7" rx="1.2" stroke="currentColor" strokeWidth="1.3"/><path d="M3 8H2a1 1 0 0 1-1-1V2a1 1 0 0 1 1-1h5a1 1 0 0 1 1 1v1" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round"/></svg>
+                              <span className="history-copy-label">⌘C</span>
+                            </button>
                           </div>
                         </div>
-                        <div className="history-card-footer">
-                          <span className="history-time">{formatTime(item.timestamp)}</span>
-                          <button className="history-copy" onClick={(e) => copyHistoryItem(item, e)} title="Copy image to clipboard">
-                            <svg width="12" height="12" viewBox="0 0 12 12" fill="none"><rect x="4" y="4" width="7" height="7" rx="1.2" stroke="currentColor" strokeWidth="1.3"/><path d="M3 8H2a1 1 0 0 1-1-1V2a1 1 0 0 1 1-1h5a1 1 0 0 1 1 1v1" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round"/></svg>
-                            <span className="history-copy-label">⌘C</span>
+                      ))}
+                    </div>
+                  )}
+                </div>
+
+                {/* ── Context menu ── */}
+                {contextMenu && (
+                  <div
+                    className="history-context-menu"
+                    style={{ top: contextMenu.y, left: contextMenu.x }}
+                    onClick={e => e.stopPropagation()}
+                  >
+                    {folders.length > 0 ? (
+                      <>
+                        {folders.map(folder => (
+                          <button key={folder.id} className="ctx-item" onClick={() => { moveItemToFolder(contextMenu.item.id, folder.id); setContextMenu(null); }}>
+                            Move to "{folder.name}"
                           </button>
-                        </div>
-                      </div>
-                    ))}
+                        ))}
+                        {contextMenu.item.folderId && (
+                          <button className="ctx-item" onClick={() => { moveItemToFolder(contextMenu.item.id, null); setContextMenu(null); }}>
+                            Remove from folder
+                          </button>
+                        )}
+                        <div className="ctx-sep" />
+                      </>
+                    ) : (
+                      <button className="ctx-item ctx-item--disabled">No folders yet — create one on the left</button>
+                    )}
+                    <button className="ctx-item" onClick={e => { copyHistoryItem(contextMenu.item, e as unknown as React.MouseEvent); setContextMenu(null); }}>Copy to clipboard</button>
+                    <button className="ctx-item ctx-item--danger" onClick={e => { deleteFromHistory(contextMenu.item.id, e as unknown as React.MouseEvent); setContextMenu(null); }}>Delete</button>
                   </div>
                 )}
               </div>
@@ -1586,6 +1926,13 @@ export default function App() {
       )}
 
       {toast && <div className="toast">{toast}</div>}
+
+      {/* ── Drag ghost: floating thumbnail that follows the cursor ── */}
+      {dragGhostSrc && (
+        <div className="history-drag-ghost" ref={dragGhostRef}>
+          <img src={`data:image/png;base64,${dragGhostSrc}`} alt="" draggable={false} />
+        </div>
+      )}
 
       {permissionHint && (
         <div className="perm-hint-overlay" onClick={() => setPermissionHint(false)}>

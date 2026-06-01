@@ -137,8 +137,11 @@ function CapturoLogo({ size = 28 }: { size?: number }) {
 }
 
 function drawWatermark(ctx: CanvasRenderingContext2D, cw: number, ch: number, wmPadding: number, framePad: number = 0) {
+  // Size proportional to image so the text is always readable at any display scale.
+  // shortSide * 0.018 → ~13px on a 720px image, ~22px on 1200px, ~40px on a 4K image.
+  // No upper cap — a large image needs a large watermark to stay legible in preview.
   const shortSide = Math.max(1, Math.min(cw, ch));
-  const fontSize = Math.max(12, Math.min(18, Math.round(shortSide * 0.017)));
+  const fontSize = Math.max(13, Math.round(shortSide * 0.018));
   const label = "Screenshot by Capturo";
 
   ctx.save();
@@ -352,6 +355,7 @@ export default function App() {
   const [dragGhostSrc, setDragGhostSrc] = useState<string | null>(null);
   const [externalDragOver, setExternalDragOver] = useState(false);
   const [zoom, setZoom] = useState(1);
+  const [baseCanvasCSS, setBaseCanvasCSS] = useState<{w:number,h:number}|null>(null);
   const [showClearHistoryConfirm, setShowClearHistoryConfirm] = useState(false);
   // Ref always pointing to the latest triggerCapture — used by the shortcut handler
   // so it picks up the latest preferences even though the effect runs only once.
@@ -454,13 +458,28 @@ export default function App() {
       ctx.fillStyle = bg.css; ctx.fillRect(0, 0, cw, ch);
     }
 
-    ctx.save();
+    const r = radius, x = padding, y = padding, w = iw, h = ih;
+
+    // ── Shadow pass (must be before clip so shadow renders outside the image rect) ──
     if (shadow > 0) {
+      ctx.save();
       ctx.shadowColor = "rgba(0,0,0,0.55)";
       ctx.shadowBlur  = shadow * 1.5;
       ctx.shadowOffsetY = shadow * 0.4;
+      ctx.beginPath();
+      ctx.moveTo(x+r,y); ctx.lineTo(x+w-r,y); ctx.quadraticCurveTo(x+w,y,x+w,y+r);
+      ctx.lineTo(x+w,y+h-r); ctx.quadraticCurveTo(x+w,y+h,x+w-r,y+h);
+      ctx.lineTo(x+r,y+h); ctx.quadraticCurveTo(x,y+h,x,y+h-r);
+      ctx.lineTo(x,y+r); ctx.quadraticCurveTo(x,y,x+r,y);
+      ctx.closePath();
+      // Opaque fill so the shadow is cast at full strength; the image drawn next will cover this fill exactly
+      ctx.fillStyle = "#fff";
+      ctx.fill();
+      ctx.restore();
     }
-    const r = radius, x = padding, y = padding, w = iw, h = ih;
+
+    // ── Image pass (clip to rounded rect, then draw image) ──
+    ctx.save();
     ctx.beginPath();
     ctx.moveTo(x+r,y); ctx.lineTo(x+w-r,y); ctx.quadraticCurveTo(x+w,y,x+w,y+r);
     ctx.lineTo(x+w,y+h-r); ctx.quadraticCurveTo(x+w,y+h,x+w-r,y+h);
@@ -471,7 +490,9 @@ export default function App() {
     ctx.drawImage(img, x, y, w, h);
     if (blur > 0) ctx.filter = "none";
     ctx.restore();
-    if (preferences.includeWatermark) drawWatermark(ctx, cw, ch, preferences.watermarkPadding, padding);
+    if (preferences.includeWatermark) {
+      drawWatermark(ctx, cw, ch, preferences.watermarkPadding, padding);
+    }
     }, [bg, padding, radius, shadow, blur, preferences.includeWatermark, preferences.watermarkPadding]);
 
   useEffect(() => {
@@ -483,6 +504,17 @@ export default function App() {
 
   // Keep compositeRef pointing at the latest composite so we can call it from stable callbacks
   useEffect(() => { compositeRef.current = composite; }, [composite]);
+
+  // Track the natural CSS display size of the canvas at zoom=1 for zoom scrolling
+  useEffect(() => {
+    if (!croppedShot || !canvasRef.current || zoom !== 1) return;
+    const id = requestAnimationFrame(() => {
+      if (canvasRef.current) {
+        setBaseCanvasCSS({ w: canvasRef.current.offsetWidth, h: canvasRef.current.offsetHeight });
+      }
+    });
+    return () => cancelAnimationFrame(id);
+  }, [croppedShot, zoom]);
 
   // Repaint when switching to editor tab — canvas may have been unmounted while on history tab
   useEffect(() => {
@@ -888,7 +920,11 @@ export default function App() {
   const triggerCapture = async () => {
     if (captureInProgress.current) return;  // prevent double-invoke
     captureInProgress.current = true;
-    setMode("capturing");
+    // Only show the full-screen capturing overlay when the window will be hidden
+    // (so the user sees feedback while the window is gone). When not hiding, keep
+    // the normal UI visible — showing a black "Preparing capture…" over it is confusing.
+    const willHide = preferences.hideWindowOnCapture && !isWindows && isTauri();
+    if (willHide || preferences.captureDelay > 0) setMode("capturing");
     try {
       if (preferences.captureDelay > 0) {
         for (let i = preferences.captureDelay; i > 0; i--) {
@@ -1558,16 +1594,16 @@ export default function App() {
                       <div
                         className="canvas-center"
                         onWheel={handleZoomWheel}
-                        style={zoom !== 1 ? { overflow: 'auto', alignItems: 'flex-start', justifyContent: 'center' } : {}}
+                        style={zoom !== 1 ? { overflow: 'auto', alignItems: 'flex-start', justifyContent: 'flex-start' } : {}}
                       >
-                      <div className="canvas-stack" style={zoom !== 1 ? { zoom: zoom, margin: '20px auto' } as React.CSSProperties : {}}>
-                        <canvas ref={canvasRef} className="output-canvas" />
+                      <div className="canvas-stack" style={zoom !== 1 && baseCanvasCSS ? { margin: '20px auto', flexShrink: 0, width: Math.round(baseCanvasCSS.w * zoom), height: Math.round(baseCanvasCSS.h * zoom) } : {}}>
+                        <canvas ref={canvasRef} className="output-canvas" style={zoom !== 1 && baseCanvasCSS ? { width: Math.round(baseCanvasCSS.w * zoom), height: Math.round(baseCanvasCSS.h * zoom), maxWidth: 'none', maxHeight: 'none' } : {}} />
                         <canvas
                           ref={annCanvasRef}
                           className={`ann-canvas${(annTool || annotations.length > 0) ? " ann-canvas--active" : ""}`}
                           style={{
                             cursor: annTool === "text" ? "text" : annTool === "pen" ? PEN_CURSOR : annTool === "eraser" ? ERASER_CURSOR : annTool ? "crosshair" : annotations.length > 0 ? "grab" : "default",
-                            pointerEvents: textInput ? "none" : undefined,
+                            pointerEvents: (textInput || zoom !== 1) ? "none" : undefined,
                           }}
                           onMouseDown={onAnnMouseDown}
                           onMouseMove={onAnnMouseMove}

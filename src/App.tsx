@@ -351,6 +351,11 @@ export default function App() {
   const dragGhostRef = useRef<HTMLDivElement>(null);
   const [dragGhostSrc, setDragGhostSrc] = useState<string | null>(null);
   const [externalDragOver, setExternalDragOver] = useState(false);
+  const [zoom, setZoom] = useState(1);
+  const [showClearHistoryConfirm, setShowClearHistoryConfirm] = useState(false);
+  // Ref always pointing to the latest triggerCapture — used by the shortcut handler
+  // so it picks up the latest preferences even though the effect runs only once.
+  const triggerCaptureRef = useRef<() => Promise<void>>(() => Promise.resolve());
 
   // ── Displayed history (filtered by active folder) ────────────────────────
   const displayedHistory = useMemo(() =>
@@ -698,8 +703,9 @@ export default function App() {
   // ── Global shortcut ──────────────────────────────────────────────────────
   useEffect(() => {
     if (!isTauri()) return;
-    register(SHORTCUT_ACCELERATOR, triggerCapture).catch(console.error);
+    register(SHORTCUT_ACCELERATOR, () => triggerCaptureRef.current()).catch(console.error);
     return () => { unregisterAll().catch(console.error); };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   useEffect(() => {
@@ -795,6 +801,14 @@ export default function App() {
     return () => { unlisten?.(); };
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  // ── Zoom wheel handler for the canvas area ──────────────────────────────
+  const handleZoomWheel = (e: React.WheelEvent) => {
+    if (!e.ctrlKey && !e.metaKey) return;
+    e.preventDefault();
+    const delta = e.deltaY > 0 ? -0.1 : 0.1;
+    setZoom(z => Math.min(4, Math.max(0.25, Math.round((z + delta) * 10) / 10)));
+  };
 
   // ── Undo keyboard shortcut ───────────────────────────────────────────────
   useEffect(() => {
@@ -900,6 +914,7 @@ export default function App() {
         document.body.classList.add("capturo-reset-cursor");
         setTimeout(() => document.body.classList.remove("capturo-reset-cursor"), 600);
       setCroppedShot(b64);
+      setZoom(1);
       setAnnotations([]); setAnnDraft(null); setAnnTool(null);
       setMode("idle");
       setActiveTab("editor");
@@ -927,6 +942,8 @@ export default function App() {
       setCountdown(null);
     }
   };
+  // Keep ref in sync on every render so the shortcut callback always uses latest preferences
+  triggerCaptureRef.current = triggerCapture;
 
   // ── Windows capture selection callback ───────────────────────────────────
   const handleWindowsSelection = async (b64: string) => {
@@ -1050,7 +1067,7 @@ export default function App() {
     } catch { showToast("Save failed"); }
   };
 
-  const startNew = () => { setCroppedShot(null); setAnnotations([]); setAnnTool(null); setTextInput(null); };
+  const startNew = () => { setCroppedShot(null); setAnnotations([]); setAnnTool(null); setTextInput(null); setZoom(1); };
 
   const commitTextAnnotation = (val?: string) => {
     const value = (val ?? textInputValue).trim();
@@ -1538,8 +1555,12 @@ export default function App() {
                         </div>
                       </div>
 
-                      <div className="canvas-center">
-                      <div className="canvas-stack">
+                      <div
+                        className="canvas-center"
+                        onWheel={handleZoomWheel}
+                        style={zoom !== 1 ? { overflow: 'auto', alignItems: 'flex-start', justifyContent: 'center' } : {}}
+                      >
+                      <div className="canvas-stack" style={zoom !== 1 ? { zoom: zoom, margin: '20px auto' } as React.CSSProperties : {}}>
                         <canvas ref={canvasRef} className="output-canvas" />
                         <canvas
                           ref={annCanvasRef}
@@ -1585,6 +1606,16 @@ export default function App() {
                           </>
                         )}
                       </div>
+                      </div>
+                      {/* ── Zoom bar ── */}
+                      <div className="zoom-bar">
+                        <button className="zoom-btn" title="Zoom out (Ctrl/⌘ + scroll)" onClick={() => setZoom(z => Math.max(0.25, Math.round((z - 0.25) * 4) / 4))}>
+                          <svg width="11" height="11" viewBox="0 0 11 11" fill="none"><path d="M1 5.5h9" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round"/></svg>
+                        </button>
+                        <button className="zoom-pct" title="Reset zoom" onClick={() => setZoom(1)}>{Math.round(zoom * 100)}%</button>
+                        <button className="zoom-btn" title="Zoom in (Ctrl/⌘ + scroll)" onClick={() => setZoom(z => Math.min(4, Math.round((z + 0.25) * 4) / 4))}>
+                          <svg width="11" height="11" viewBox="0 0 11 11" fill="none"><path d="M5.5 1v9M1 5.5h9" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round"/></svg>
+                        </button>
                       </div>
                     </div>
                   ) : (
@@ -1914,7 +1945,7 @@ export default function App() {
                     <label className="pref-toggle"><input type="checkbox" checked={preferences.saveHistory} onChange={e => updatePref("saveHistory", e.target.checked)} /><span>Save screenshot history</span></label>
                     <div className="pref-row">
                       <span>{history.length} screenshots stored</span>
-                      <button className="btn btn-ghost" onClick={() => replaceHistory([], true)}>Clear History</button>
+                      <button className="btn btn-ghost" onClick={() => setShowClearHistoryConfirm(true)}>Clear History</button>
                     </div>
                   </section>
                 </div>
@@ -1926,6 +1957,20 @@ export default function App() {
       )}
 
       {toast && <div className="toast">{toast}</div>}
+
+      {/* ── Clear History confirmation dialog ── */}
+      {showClearHistoryConfirm && (
+        <div className="confirm-overlay" onClick={() => setShowClearHistoryConfirm(false)}>
+          <div className="confirm-dialog" onClick={e => e.stopPropagation()}>
+            <h3>Clear All History?</h3>
+            <p>This will permanently delete all {history.length} screenshot{history.length !== 1 ? 's' : ''}. This cannot be undone.</p>
+            <div className="confirm-actions">
+              <button className="btn btn-ghost" onClick={() => setShowClearHistoryConfirm(false)}>Cancel</button>
+              <button className="btn btn-danger" onClick={() => { replaceHistory([], true); setShowClearHistoryConfirm(false); }}>Delete All</button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* ── Drag ghost: floating thumbnail that follows the cursor ── */}
       {dragGhostSrc && (

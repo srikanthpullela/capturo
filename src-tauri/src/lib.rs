@@ -34,7 +34,7 @@ mod commands {
     /// Interactive capture: hides window, shows native macOS crosshair selector,
     /// returns the selected region as base64 PNG. No fullscreen mode needed.
     #[tauri::command]
-    pub async fn capture_interactive(app: AppHandle, hide_window: Option<bool>) -> Result<String, String> {
+    pub async fn capture_interactive(app: AppHandle, hide_window: bool) -> Result<String, String> {
         #[cfg(target_os = "macos")]
         {
             // Consume macOS' first screencapture/TCC initialization pass before
@@ -48,7 +48,7 @@ mod commands {
             tokio::time::sleep(std::time::Duration::from_millis(120)).await;
         }
 
-        let should_hide_window = hide_window.unwrap_or(true);
+        let should_hide_window = hide_window;
         let was_visible = app
             .get_webview_window("main")
             .and_then(|win| win.is_visible().ok())

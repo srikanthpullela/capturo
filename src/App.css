@@ -370,6 +370,56 @@ html, body, #root { height: 100%; overflow: hidden; background: var(--c-bg); col
   padding: 10px 20px; border-radius: var(--r-lg);
   font-size: 13px; font-weight: 500;
   box-shadow: 0 8px 32px rgba(0,0,0,0.5);
+}
+
+/* ── Zoom bar ── */
+.zoom-bar {
+  display: flex; align-items: center; gap: 4px;
+  padding: 4px 8px; margin-top: 6px;
+  background: var(--c-surf); border: 1px solid var(--c-border);
+  border-radius: var(--r-lg); align-self: center; flex-shrink: 0;
+  user-select: none;
+}
+.zoom-btn {
+  width: 24px; height: 24px; display: flex; align-items: center; justify-content: center;
+  background: none; border: none; color: var(--c-text); cursor: pointer;
+  border-radius: var(--r-sm); padding: 0; transition: background 0.1s;
+}
+.zoom-btn:hover { background: var(--c-surf2); }
+.zoom-pct {
+  min-width: 40px; text-align: center; font-size: 11px; font-weight: 600;
+  color: var(--c-muted); background: none; border: none; cursor: pointer;
+  border-radius: var(--r-sm); padding: 3px 4px; transition: background 0.1s, color 0.1s;
+}
+.zoom-pct:hover { background: var(--c-surf2); color: var(--c-text); }
+
+/* ── Confirmation dialog ── */
+.confirm-overlay {
+  position: fixed; inset: 0; z-index: 20000;
+  background: rgba(0,0,0,0.6); backdrop-filter: blur(4px);
+  display: flex; align-items: center; justify-content: center;
+  animation: confirmFadeIn 0.15s ease;
+}
+@keyframes confirmFadeIn {
+  from { opacity: 0; }
+  to   { opacity: 1; }
+}
+.confirm-dialog {
+  background: var(--c-surf); border: 1px solid var(--c-border2);
+  border-radius: var(--r-xl, 16px); padding: 28px 28px 24px;
+  min-width: 320px; max-width: 400px;
+  box-shadow: 0 20px 60px rgba(0,0,0,0.6);
+  animation: confirmSlideIn 0.15s ease;
+}
+@keyframes confirmSlideIn {
+  from { transform: translateY(12px) scale(0.97); opacity: 0; }
+  to   { transform: translateY(0) scale(1); opacity: 1; }
+}
+.confirm-dialog h3 { margin: 0 0 10px; font-size: 17px; font-weight: 700; }
+.confirm-dialog p  { margin: 0 0 24px; color: var(--c-muted); font-size: 13px; line-height: 1.55; }
+.confirm-actions   { display: flex; gap: 10px; justify-content: flex-end; }
+.btn-danger { background: #ef4444 !important; color: #fff !important; border: none; }
+.btn-danger:hover { background: #dc2626 !important; }
   backdrop-filter: blur(16px);
   z-index: 9999;
   animation: toast-in 0.2s ease;

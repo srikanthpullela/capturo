@@ -331,7 +331,6 @@ export default function App() {
   const [alwaysOnTop, setAlwaysOnTop] = useState(false);
 
   const isWindows = navigator.userAgent.includes('Windows');
-  const isMac = !isWindows && /Macintosh|Mac OS X/i.test(navigator.userAgent);
   const [winCapture, setWinCapture] = useState<{ base64: string; screenWidth: number; screenHeight: number } | null>(null);
 
   const canvasRef    = useRef<HTMLCanvasElement>(null);
@@ -967,16 +966,12 @@ export default function App() {
   }, [composite]);
 
   // ── Capture flow ─────────────────────────────────────────────────────────
-  // Uses screencapture -i: hides window → native macOS crosshair → returns cropped PNG.
-  // Uses screencapture -i on macOS (native crosshair) or a fullscreen overlay
-  // on macOS/Windows. Both paths return a cropped PNG as base64.
+  // macOS: uses screencapture -i (native system crosshair — covers the full
+  // screen including the menu bar). Windows: fullscreen overlay.
   const triggerCapture = async () => {
     if (captureInProgress.current) return;  // prevent double-invoke
     captureInProgress.current = true;
-    // Only show the full-screen capturing overlay when the window will be hidden
-    // (so the user sees feedback while the window is gone). When not hiding, keep
-    // the normal UI visible — showing a black "Preparing capture…" over it is confusing.
-    const willHide = preferences.hideWindowOnCapture && !isWindows && !isMac && isTauri();
+    const willHide = preferences.hideWindowOnCapture && !isWindows && isTauri();
     if (willHide || preferences.captureDelay > 0) setMode("capturing");
     try {
       if (preferences.captureDelay > 0) {
@@ -991,12 +986,8 @@ export default function App() {
         captureInProgress.current = false;
         return;
       }
-      // Windows and macOS both use the fullscreen-overlay flow so the user can
-      // drag from anywhere on the screen — including the menu bar on macOS and
-      // the title-bar area on Windows.
-      if (isWindows || isMac) {
-        const command = isWindows ? 'capture_full_screen_windows' : 'capture_fullscreen_mac';
-        const data = await invoke<{ base64: string; screenWidth: number; screenHeight: number }>(command);
+      if (isWindows) {
+        const data = await invoke<{ base64: string; screenWidth: number; screenHeight: number }>('capture_full_screen_windows');
         setWinCapture(data);
         setMode('idle');
         captureInProgress.current = false;
@@ -1038,13 +1029,10 @@ export default function App() {
   // Keep ref in sync on every render so the shortcut callback always uses latest preferences
   triggerCaptureRef.current = triggerCapture;
 
-  // ── Capture-overlay selection callback (Windows & macOS) ─────────────────
+  // ── Windows capture selection callback ───────────────────────────────────
   const handleWindowsSelection = async (b64: string) => {
     setWinCapture(null);
-    if (isTauri()) {
-      if (isWindows) await invoke('exit_windows_capture').catch(() => {});
-      else if (isMac) await invoke('exit_mac_capture').catch(() => {});
-    }
+    if (isTauri()) await invoke('exit_windows_capture').catch(() => {});
     setCroppedShot(b64);
     setAnnotations([]); setAnnDraft(null); setAnnTool(null);
     setMode('idle');
@@ -1490,10 +1478,7 @@ export default function App() {
           onCapture={handleWindowsSelection}
           onCancel={() => {
             setWinCapture(null);
-            if (isTauri()) {
-              if (isWindows) invoke('exit_windows_capture').catch(() => {});
-              else if (isMac) invoke('exit_mac_capture').catch(() => {});
-            }
+            if (isTauri()) invoke('exit_windows_capture').catch(() => {});
             setMode('idle');
             captureInProgress.current = false;
           }}

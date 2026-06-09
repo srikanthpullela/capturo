@@ -1,8 +1,18 @@
 use base64::{engine::general_purpose, Engine as _};
 use image::{DynamicImage, ImageFormat};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::io::Cursor;
 use tauri::{AppHandle, Emitter, Manager};
+
+/// Structured response from load_history so the frontend can distinguish
+/// "file not found" (fresh install) from real I/O errors without brittle
+/// string matching on error messages.
+#[derive(Serialize)]
+pub struct LoadHistoryResult {
+    pub status: &'static str, // "ok" | "missing" | "error"
+    pub data: Option<String>,
+    pub message: Option<String>,
+}
 
 fn reveal_main_window(app: &AppHandle) {
     if let Some(win) = app.get_webview_window("main") {
@@ -574,12 +584,22 @@ mod commands {
     }
 
     /// Load screenshot history JSON from the app-local-data directory.
+    /// Returns a structured result so the frontend can distinguish "file not found"
+    /// (fresh install — safe to start fresh) from real I/O errors (permissions,
+    /// disk full, etc. — NOT safe to overwrite the file with empty data).
     #[tauri::command]
-    pub async fn load_history(app: AppHandle) -> Result<String, String> {
-        let path = app.path().app_local_data_dir()
-            .map_err(|e| e.to_string())?
-            .join("capturo_history.json");
-        std::fs::read_to_string(&path).map_err(|e| e.to_string())
+    pub async fn load_history(app: AppHandle) -> LoadHistoryResult {
+        let path = match app.path().app_local_data_dir() {
+            Ok(dir) => dir.join("capturo_history.json"),
+            Err(e) => return LoadHistoryResult { status: "error", data: None, message: Some(e.to_string()) },
+        };
+        match std::fs::read_to_string(&path) {
+            Ok(data) => LoadHistoryResult { status: "ok", data: Some(data), message: None },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                LoadHistoryResult { status: "missing", data: None, message: None }
+            }
+            Err(e) => LoadHistoryResult { status: "error", data: None, message: Some(e.to_string()) },
+        }
     }
 }
 

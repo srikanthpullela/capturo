@@ -187,7 +187,9 @@ function saveFolders(flds: Folder[]) {
   localStorage.setItem("capturo_folders", JSON.stringify(flds));
 }
 
-function parseHistoryItems(text: string | null): HistoryItem[] {
+// Returns null when the input text exists but cannot be parsed (corrupt JSON).
+// Returns [] for null/empty input (no file yet) or a valid empty array.
+function parseHistoryItems(text: string | null): HistoryItem[] | null {
   if (!text) return [];
   try {
     const parsed = JSON.parse(text);
@@ -203,7 +205,7 @@ function parseHistoryItems(text: string | null): HistoryItem[] {
       typeof item.shadow === "number"
     );
   } catch {
-    return [];
+    return null; // corrupt JSON — caller must not overwrite the source
   }
 }
 
@@ -356,6 +358,10 @@ export default function App() {
   const captureInProgress  = useRef(false);
   const compositeRef = useRef<() => void>(() => {});
   const historyRef = useRef<HistoryItem[]>([]);
+  // True once we have confirmed what is on disk (or confirmed fresh install).
+  // persistHistory must never write to disk before this is set, otherwise a
+  // failed/slow load would overwrite the existing file with fewer items.
+  const historyDiskReady = useRef(!isTauri()); // browser mode is always ready
   const dragRef = useRef<{ item: HistoryItem; startX: number; startY: number; grabOffsetX: number; grabOffsetY: number; active: boolean } | null>(null);
   const wasDraggingRef = useRef(false);
   const dragGhostRef = useRef<HTMLDivElement>(null);
@@ -401,6 +407,9 @@ export default function App() {
       }
       return;
     }
+    // Guard: never write to disk before we have confirmed what is already there.
+    // This prevents a failed/slow startup load from destroying the existing file.
+    if (!historyDiskReady.current) return;
     invoke("save_history", { data: JSON.stringify(items) }).catch((e) => {
       console.error("save_history failed", e);
       showToast("History save failed");
@@ -905,46 +914,70 @@ export default function App() {
     return () => window.removeEventListener("keydown", onKey);
   }, []);
 
-  // ── Load history from disk on mount (no localStorage 5MB quota) ──────────
-  useEffect(() => {
-    historyRef.current = history;
-  }, [history]);
-
+  // ── Load history on mount ────────────────────────────────────────────────
+  // Deps: [] — runs exactly once. We intentionally do NOT include persistHistory
+  // here; re-running on every preference change was a bug that could overwrite
+  // the disk file with stale in-memory state.
   useEffect(() => {
     if (!isTauri()) {
-      try {
-        const parsed = parseHistoryItems(localStorage.getItem("capturo_history"));
-        historyRef.current = parsed;
-        if (parsed.length > 0) setHistory(parsed);
-      } catch {}
+      // Browser fallback: localStorage is the only source.
+      const parsed = parseHistoryItems(localStorage.getItem("capturo_history")) ?? [];
+      historyRef.current = parsed;
+      if (parsed.length > 0) setHistory(parsed);
+      // historyDiskReady is pre-set to true for non-Tauri in the ref initializer.
       setHistoryLoaded(true);
       return;
     }
     (async () => {
-      let diskHistory: HistoryItem[] = [];
-      let diskLoadOk = false;
-      let browserHistory: HistoryItem[] = [];
-      try {
-        const text = await invoke<string>("load_history");
-        diskHistory = parseHistoryItems(text);
-        diskLoadOk = true;
-      } catch (e) {
-        console.error("load_history failed — keeping disk file unchanged", e);
+      type LoadResult = { status: string; data?: string; message?: string };
+      const result = await invoke<LoadResult>("load_history");
+
+      if (result.status === "error") {
+        // Real I/O error (permissions, disk, etc.).
+        // Leave historyDiskReady=false so persistHistory won't overwrite.
+        console.error("load_history I/O error:", result.message);
+        showToast("Could not load history — existing data preserved");
+        setHistoryLoaded(true);
+        return;
       }
-      // Merge current localStorage key + legacy "snapcraft_history" key
-      const legacyHistory = parseHistoryItems(localStorage.getItem("snapcraft_history"));
-      browserHistory = parseHistoryItems(localStorage.getItem("capturo_history"));
-      const merged = mergeHistoryItems(diskHistory, browserHistory, legacyHistory);
-      historyRef.current = merged;
-      setHistory(merged);
+
+      if (result.status === "missing") {
+        // Fresh install: no file yet. Check legacy localStorage keys for
+        // one-time migration before we create the disk file.
+        const legacy = parseHistoryItems(localStorage.getItem("snapcraft_history")) ?? [];
+        const browser = parseHistoryItems(localStorage.getItem("capturo_history")) ?? [];
+        const migrated = mergeHistoryItems(legacy, browser);
+        historyRef.current = migrated;
+        setHistory(migrated);
+        historyDiskReady.current = true;
+        setHistoryLoaded(true);
+        // Write the migrated data to disk immediately so next launch loads from disk.
+        if (migrated.length > 0) {
+          invoke("save_history", { data: JSON.stringify(migrated) }).catch(console.error);
+        }
+        return;
+      }
+
+      // status === "ok": file read successfully.
+      const parsed = parseHistoryItems(result.data ?? null);
+      if (parsed === null) {
+        // Corrupt JSON in the disk file. Preserve it; don't overwrite.
+        console.error("capturo_history.json contains corrupt JSON — preserved unchanged");
+        showToast("History file is corrupt — please contact support");
+        setHistoryLoaded(true);
+        // historyDiskReady stays false
+        return;
+      }
+
+      historyRef.current = parsed;
+      setHistory(parsed);
+      historyDiskReady.current = true;
       setHistoryLoaded(true);
-      // CRITICAL: only overwrite disk if we successfully loaded from it.
-      // Overwriting on a failed load would destroy items already on disk.
-      if (diskLoadOk) {
-        persistHistory(merged, true);
-      }
+      // Re-save immediately to normalise format (e.g. add new default fields).
+      invoke("save_history", { data: JSON.stringify(parsed) }).catch(console.error);
     })();
-  }, [persistHistory]);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []); // intentional empty deps — see comment above
 
   // ── History persistence ───────────────────────────────────────────────────
   useEffect(() => {

@@ -346,6 +346,13 @@ export default function App() {
     const annDragId     = useRef<string | null>(null);
     const annDragOffset = useRef<AnnPoint>({ x: 0, y: 0 });
     const penPoints     = useRef<AnnPoint[]>([]);
+  // Always-current refs used by the document-level pointer listeners below.
+  // Assigned synchronously in render so they never go stale inside closures.
+  const annToolRef      = useRef<AnnTool>(null);
+  const annColorRef     = useRef("");
+  const annLineWidthRef = useRef(3);
+  const annDraftRef     = useRef<Annotation | null>(null);
+  const annotationsRef  = useRef<Annotation[]>([]);
   const toastTimer         = useRef<ReturnType<typeof setTimeout> | null>(null);
   const captureInProgress  = useRef(false);
   const compositeRef = useRef<() => void>(() => {});
@@ -361,6 +368,13 @@ export default function App() {
   // Ref always pointing to the latest triggerCapture — used by the shortcut handler
   // so it picks up the latest preferences even though the effect runs only once.
   const triggerCaptureRef = useRef<() => Promise<void>>(() => Promise.resolve());
+
+  // Sync always-current refs with state (runs every render, no lag).
+  annToolRef.current      = annTool;
+  annColorRef.current     = annColor;
+  annLineWidthRef.current = annLineWidth;
+  annotationsRef.current  = annotations;
+  annDraftRef.current     = annDraft;
 
   // ── Displayed history (filtered by active folder) ────────────────────────
   const displayedHistory = useMemo(() =>
@@ -644,9 +658,6 @@ export default function App() {
         annDragId.current = hit.id;
         annDragOffset.current = { x: pos.x - hit.x1, y: pos.y - hit.y1 };
         annDragging.current = true;
-        // Capture the pointer so dragging continues even when the cursor
-        // moves outside the canvas boundary.
-        canvas.setPointerCapture(e.pointerId);
         e.preventDefault();
       }
       return;
@@ -685,58 +696,91 @@ export default function App() {
     annDragging.current = true;
     annStart.current = pos;
     if (annTool === "pen") penPoints.current = [pos];
-    // Capture the pointer so drawing continues even when cursor leaves the canvas.
-    canvas.setPointerCapture(e.pointerId);
     e.preventDefault();
   };
 
-  const onAnnMouseMove = (e: React.PointerEvent<HTMLCanvasElement>) => {
-    const rect = (e.currentTarget as HTMLCanvasElement).getBoundingClientRect();
-    const pos: AnnPoint = { x: e.clientX - rect.left, y: e.clientY - rect.top };
+  // Global document listeners handle pointermove and pointerup so that drawing
+  // and annotation-dragging continue even when the cursor leaves the canvas.
+  // Coordinates are clamped to the canvas boundary so annotations never extend
+  // past the visible edge.
+  useEffect(() => {
+    const canvas = annCanvasRef.current;
+    if (!canvas) return;
 
-    // Drag existing annotation
-    if (annDragId.current && annDragging.current) {
-      const newX1 = pos.x - annDragOffset.current.x;
-      const newY1 = pos.y - annDragOffset.current.y;
-      setAnnotations(prev => prev.map(a => {
-        if (a.id !== annDragId.current) return a;
-        const dx = newX1 - a.x1, dy = newY1 - a.y1;
-        return { ...a, x1: newX1, y1: newY1, x2: a.x2 + dx, y2: a.y2 + dy,
-          points: a.points?.map(p => ({ x: p.x + dx, y: p.y + dy })) };
-      }));
-      return;
-    }
+    const getClampedPos = (clientX: number, clientY: number): AnnPoint => {
+      const r = canvas.getBoundingClientRect();
+      return {
+        x: Math.max(0, Math.min(r.width,  clientX - r.left)),
+        y: Math.max(0, Math.min(r.height, clientY - r.top)),
+      };
+    };
 
-    if (!annDragging.current || !annTool) return;
-    if (annTool === "pen") {
-      if (penPoints.current.length === 0) return; // safety: no start point yet
-      penPoints.current = [...penPoints.current, pos];
-      setAnnDraft({
-        id: "draft", tool: "pen",
-        x1: penPoints.current[0].x, y1: penPoints.current[0].y,
-        x2: pos.x, y2: pos.y,
-        color: annColor, lineWidth: annLineWidth,
-        points: [...penPoints.current],
-      });
-    } else {
-      setAnnDraft({
-        id: "draft", tool: annTool,
-        x1: annStart.current.x, y1: annStart.current.y,
-        x2: pos.x, y2: pos.y,
-        color: annColor, lineWidth: annLineWidth,
-      });
-    }
-  };
+    const handleMove = (e: PointerEvent) => {
+      if (!annDragging.current) return;
+      const pos  = getClampedPos(e.clientX, e.clientY);
+      const tool = annToolRef.current;
+      const color     = annColorRef.current;
+      const lineWidth = annLineWidthRef.current;
 
-  const onAnnMouseUp = (_e?: React.PointerEvent<HTMLCanvasElement>) => {
-    if (annDragId.current) { annDragId.current = null; annDragging.current = false; return; }
-    if (!annDragging.current || !annTool || !annDraft) { annDragging.current = false; return; }
-    annDragging.current = false;
-    pushUndo(annotations);
-    setAnnotations(prev => [...prev, { ...annDraft, id: Date.now().toString() }]);
-    setAnnDraft(null);
-    if (annTool === "pen") penPoints.current = [];
-  };
+      // Moving an existing annotation
+      if (annDragId.current) {
+        const newX1 = pos.x - annDragOffset.current.x;
+        const newY1 = pos.y - annDragOffset.current.y;
+        setAnnotations(prev => prev.map(a => {
+          if (a.id !== annDragId.current) return a;
+          const dx = newX1 - a.x1, dy = newY1 - a.y1;
+          return { ...a, x1: newX1, y1: newY1, x2: a.x2 + dx, y2: a.y2 + dy,
+            points: a.points?.map(p => ({ x: p.x + dx, y: p.y + dy })) };
+        }));
+        return;
+      }
+
+      if (!tool) return;
+      if (tool === "pen") {
+        if (penPoints.current.length === 0) return;
+        penPoints.current = [...penPoints.current, pos];
+        const draft: Annotation = {
+          id: "draft", tool: "pen",
+          x1: penPoints.current[0].x, y1: penPoints.current[0].y,
+          x2: pos.x, y2: pos.y, color, lineWidth,
+          points: [...penPoints.current],
+        };
+        annDraftRef.current = draft;
+        setAnnDraft(draft);
+      } else {
+        const draft: Annotation = {
+          id: "draft", tool,
+          x1: annStart.current.x, y1: annStart.current.y,
+          x2: pos.x, y2: pos.y, color, lineWidth,
+        };
+        annDraftRef.current = draft;
+        setAnnDraft(draft);
+      }
+    };
+
+    const handleUp = () => {
+      if (annDragId.current) { annDragId.current = null; annDragging.current = false; return; }
+      if (!annDragging.current) return;
+      annDragging.current = false;
+      const tool  = annToolRef.current;
+      const draft = annDraftRef.current;
+      if (!tool || !draft) { annDraftRef.current = null; setAnnDraft(null); return; }
+      undoStack.current.push([...annotationsRef.current]);
+      redoStack.current = [];
+      setAnnotations(prev => [...prev, { ...draft, id: Date.now().toString() }]);
+      annDraftRef.current = null;
+      setAnnDraft(null);
+      if (tool === "pen") penPoints.current = [];
+    };
+
+    document.addEventListener('pointermove', handleMove);
+    document.addEventListener('pointerup',   handleUp);
+    return () => {
+      document.removeEventListener('pointermove', handleMove);
+      document.removeEventListener('pointerup',   handleUp);
+    };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []); // empty deps — all state is accessed through always-current refs
 
   // ── Global shortcut ──────────────────────────────────────────────────────
   useEffect(() => {
@@ -1621,11 +1665,9 @@ export default function App() {
                           style={{
                             cursor: annTool === "text" ? "text" : annTool === "pen" ? PEN_CURSOR : annTool === "eraser" ? ERASER_CURSOR : annTool ? "crosshair" : annotations.length > 0 ? "grab" : "default",
                             pointerEvents: (textInput || zoom !== 1) ? "none" : undefined,
+                            touchAction: "none",
                           }}
                           onPointerDown={onAnnMouseDown}
-                          onPointerMove={onAnnMouseMove}
-                          onPointerUp={onAnnMouseUp}
-                          onPointerCancel={onAnnMouseUp}
                         />
                         {textInput && (
                           <>

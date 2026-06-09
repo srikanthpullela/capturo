@@ -331,6 +331,7 @@ export default function App() {
   const [alwaysOnTop, setAlwaysOnTop] = useState(false);
 
   const isWindows = navigator.userAgent.includes('Windows');
+  const isMac = !isWindows && /Macintosh|Mac OS X/i.test(navigator.userAgent);
   const [winCapture, setWinCapture] = useState<{ base64: string; screenWidth: number; screenHeight: number } | null>(null);
 
   const canvasRef    = useRef<HTMLCanvasElement>(null);
@@ -629,7 +630,7 @@ export default function App() {
     redoStack.current = [];
   };
 
-  const onAnnMouseDown = (e: React.MouseEvent<HTMLCanvasElement>) => {
+  const onAnnMouseDown = (e: React.PointerEvent<HTMLCanvasElement>) => {
     const canvas = e.currentTarget as HTMLCanvasElement;
     const rect = canvas.getBoundingClientRect();
     if (rect.width === 0 || rect.height === 0) return;
@@ -643,6 +644,9 @@ export default function App() {
         annDragId.current = hit.id;
         annDragOffset.current = { x: pos.x - hit.x1, y: pos.y - hit.y1 };
         annDragging.current = true;
+        // Capture the pointer so dragging continues even when the cursor
+        // moves outside the canvas boundary.
+        canvas.setPointerCapture(e.pointerId);
         e.preventDefault();
       }
       return;
@@ -681,10 +685,12 @@ export default function App() {
     annDragging.current = true;
     annStart.current = pos;
     if (annTool === "pen") penPoints.current = [pos];
+    // Capture the pointer so drawing continues even when cursor leaves the canvas.
+    canvas.setPointerCapture(e.pointerId);
     e.preventDefault();
   };
 
-  const onAnnMouseMove = (e: React.MouseEvent<HTMLCanvasElement>) => {
+  const onAnnMouseMove = (e: React.PointerEvent<HTMLCanvasElement>) => {
     const rect = (e.currentTarget as HTMLCanvasElement).getBoundingClientRect();
     const pos: AnnPoint = { x: e.clientX - rect.left, y: e.clientY - rect.top };
 
@@ -722,7 +728,7 @@ export default function App() {
     }
   };
 
-  const onAnnMouseUp = (_e?: React.MouseEvent<HTMLCanvasElement>) => {
+  const onAnnMouseUp = (_e?: React.PointerEvent<HTMLCanvasElement>) => {
     if (annDragId.current) { annDragId.current = null; annDragging.current = false; return; }
     if (!annDragging.current || !annTool || !annDraft) { annDragging.current = false; return; }
     annDragging.current = false;
@@ -916,14 +922,15 @@ export default function App() {
 
   // ── Capture flow ─────────────────────────────────────────────────────────
   // Uses screencapture -i: hides window → native macOS crosshair → returns cropped PNG.
-  // No fullscreen mode, no custom selection overlay needed.
+  // Uses screencapture -i on macOS (native crosshair) or a fullscreen overlay
+  // on macOS/Windows. Both paths return a cropped PNG as base64.
   const triggerCapture = async () => {
     if (captureInProgress.current) return;  // prevent double-invoke
     captureInProgress.current = true;
     // Only show the full-screen capturing overlay when the window will be hidden
     // (so the user sees feedback while the window is gone). When not hiding, keep
     // the normal UI visible — showing a black "Preparing capture…" over it is confusing.
-    const willHide = preferences.hideWindowOnCapture && !isWindows && isTauri();
+    const willHide = preferences.hideWindowOnCapture && !isWindows && !isMac && isTauri();
     if (willHide || preferences.captureDelay > 0) setMode("capturing");
     try {
       if (preferences.captureDelay > 0) {
@@ -938,8 +945,12 @@ export default function App() {
         captureInProgress.current = false;
         return;
       }
-      if (isWindows) {
-        const data = await invoke<{ base64: string; screenWidth: number; screenHeight: number }>('capture_full_screen_windows');
+      // Windows and macOS both use the fullscreen-overlay flow so the user can
+      // drag from anywhere on the screen — including the menu bar on macOS and
+      // the title-bar area on Windows.
+      if (isWindows || isMac) {
+        const command = isWindows ? 'capture_full_screen_windows' : 'capture_fullscreen_mac';
+        const data = await invoke<{ base64: string; screenWidth: number; screenHeight: number }>(command);
         setWinCapture(data);
         setMode('idle');
         captureInProgress.current = false;
@@ -981,10 +992,13 @@ export default function App() {
   // Keep ref in sync on every render so the shortcut callback always uses latest preferences
   triggerCaptureRef.current = triggerCapture;
 
-  // ── Windows capture selection callback ───────────────────────────────────
+  // ── Capture-overlay selection callback (Windows & macOS) ─────────────────
   const handleWindowsSelection = async (b64: string) => {
     setWinCapture(null);
-    if (isTauri()) await invoke('exit_windows_capture').catch(() => {});
+    if (isTauri()) {
+      if (isWindows) await invoke('exit_windows_capture').catch(() => {});
+      else if (isMac) await invoke('exit_mac_capture').catch(() => {});
+    }
     setCroppedShot(b64);
     setAnnotations([]); setAnnDraft(null); setAnnTool(null);
     setMode('idle');
@@ -1421,7 +1435,7 @@ export default function App() {
   return (
     <div className="app">
 
-      {/* ── WINDOWS CAPTURE OVERLAY ── */}
+      {/* ── CAPTURE SELECTION OVERLAY (Windows & macOS) ── */}
       {winCapture && (
         <WinSelectionOverlay
           base64={winCapture.base64}
@@ -1430,7 +1444,10 @@ export default function App() {
           onCapture={handleWindowsSelection}
           onCancel={() => {
             setWinCapture(null);
-            if (isTauri()) invoke('exit_windows_capture').catch(() => {});
+            if (isTauri()) {
+              if (isWindows) invoke('exit_windows_capture').catch(() => {});
+              else if (isMac) invoke('exit_mac_capture').catch(() => {});
+            }
             setMode('idle');
             captureInProgress.current = false;
           }}
@@ -1605,10 +1622,10 @@ export default function App() {
                             cursor: annTool === "text" ? "text" : annTool === "pen" ? PEN_CURSOR : annTool === "eraser" ? ERASER_CURSOR : annTool ? "crosshair" : annotations.length > 0 ? "grab" : "default",
                             pointerEvents: (textInput || zoom !== 1) ? "none" : undefined,
                           }}
-                          onMouseDown={onAnnMouseDown}
-                          onMouseMove={onAnnMouseMove}
-                          onMouseUp={onAnnMouseUp}
-                          onMouseLeave={onAnnMouseUp}
+                          onPointerDown={onAnnMouseDown}
+                          onPointerMove={onAnnMouseMove}
+                          onPointerUp={onAnnMouseUp}
+                          onPointerCancel={onAnnMouseUp}
                         />
                         {textInput && (
                           <>
@@ -2080,15 +2097,17 @@ function WinSelectionOverlay({ base64, screenWidth, screenHeight, onCapture, onC
     }
   }, [rect]);
 
-  const handleMouseDown = (e: React.MouseEvent) => {
+  const handleMouseDown = (e: React.PointerEvent<HTMLDivElement>) => {
+    (e.currentTarget as HTMLDivElement).setPointerCapture(e.pointerId);
     setDrag({ x: e.clientX, y: e.clientY });
     setRect(null);
   };
-  const handleMouseMove = (e: React.MouseEvent) => {
+  const handleMouseMove = (e: React.PointerEvent<HTMLDivElement>) => {
     if (!drag) return;
     setRect({ x: Math.min(drag.x, e.clientX), y: Math.min(drag.y, e.clientY), w: Math.abs(e.clientX - drag.x), h: Math.abs(e.clientY - drag.y) });
   };
-  const handleMouseUp = () => {
+  const handleMouseUp = (e: React.PointerEvent<HTMLDivElement>) => {
+    (e.currentTarget as HTMLDivElement).releasePointerCapture(e.pointerId);
     if (!drag || !rect || rect.w < 10 || rect.h < 10) { setDrag(null); setRect(null); return; }
     setDrag(null);
     const img = imgRef.current;
@@ -2108,9 +2127,9 @@ function WinSelectionOverlay({ base64, screenWidth, screenHeight, onCapture, onC
     <div
       className="win-capture-overlay"
       tabIndex={0}
-      onMouseDown={handleMouseDown}
-      onMouseMove={handleMouseMove}
-      onMouseUp={handleMouseUp}
+      onPointerDown={handleMouseDown}
+      onPointerMove={handleMouseMove}
+      onPointerUp={handleMouseUp}
       onKeyDown={e => { if (e.key === 'Escape') onCancel(); }}
       ref={el => el?.focus()}
     >

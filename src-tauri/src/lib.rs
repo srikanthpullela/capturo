@@ -424,13 +424,16 @@ mod commands {
             .await
             .map_err(|e| e.to_string())??;
 
-            // Maximize so the selection overlay covers the entire screen
+            // Remove decorations and go fullscreen so the selection overlay
+            // covers the entire screen including the area that was behind the
+            // title bar. Restore decorations in exit_windows_capture.
             if let Some(win) = app.get_webview_window("main") {
+                let _ = win.set_decorations(false);
                 let _ = win.set_fullscreen(true);
                 let _ = win.show();
                 let _ = win.set_focus();
             }
-            tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+            tokio::time::sleep(std::time::Duration::from_millis(180)).await;
 
             return Ok(serde_json::json!({
                 "base64": b64,
@@ -451,6 +454,107 @@ mod commands {
     /// Windows: exit fullscreen after the user finishes the selection overlay.
     #[tauri::command]
     pub async fn exit_windows_capture(app: AppHandle) -> Result<(), String> {
+        if let Some(win) = app.get_webview_window("main") {
+            let _ = win.set_fullscreen(false);
+            let _ = win.set_decorations(true);
+            let _ = win.show();
+            let _ = win.set_focus();
+        }
+        Ok(())
+    }
+
+    /// macOS: capture the full screen silently, go fullscreen so the
+    /// selection overlay covers the entire display (including menu-bar area),
+    /// and return the screenshot together with its pixel dimensions.
+    #[tauri::command]
+    pub async fn capture_fullscreen_mac(app: AppHandle) -> Result<serde_json::Value, String> {
+        #[cfg(target_os = "macos")]
+        {
+            if let Some(win) = app.get_webview_window("main") {
+                let _ = win.hide();
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(380)).await;
+
+            let tmp = format!(
+                "/tmp/capturo_fsm_{}.png",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis()
+            );
+
+            // Silent (-x) fullscreen capture — no interactive crosshair needed.
+            let status = std::process::Command::new("screencapture")
+                .args(["-x", "-t", "png", &tmp])
+                .status()
+                .map_err(|e| format!("screencapture error: {e}"))?;
+
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+            if !status.success() || !std::path::Path::new(&tmp).exists() {
+                if let Some(win) = app.get_webview_window("main") {
+                    let _ = win.show();
+                    let _ = win.set_focus();
+                }
+                return Err("fullscreen capture failed".to_string());
+            }
+
+            let mut bytes: Vec<u8> = Vec::new();
+            for _ in 0..6 {
+                if let Ok(b) = std::fs::read(&tmp) {
+                    if b.len() >= 8 { bytes = b; break; }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+            }
+            if bytes.is_empty() {
+                bytes = std::fs::read(&tmp).map_err(|e| e.to_string())?;
+            }
+            std::fs::remove_file(&tmp).ok();
+
+            const PNG_MAGIC: &[u8] = b"\x89PNG\r\n\x1a\n";
+            if bytes.len() < 8 || &bytes[..8] != PNG_MAGIC {
+                if let Some(win) = app.get_webview_window("main") {
+                    let _ = win.show();
+                    let _ = win.set_focus();
+                }
+                return Err("permission_denied".to_string());
+            }
+
+            // Read image dimensions from the PNG.
+            let img = image::load_from_memory(&bytes).map_err(|e| e.to_string())?;
+            let (width, height) = (img.width(), img.height());
+
+            let b64 = general_purpose::STANDARD.encode(&bytes);
+
+            // Go fullscreen: on macOS the menu bar is hidden in fullscreen so the
+            // overlay can reach the very top of the screen (y = 0).
+            if let Some(win) = app.get_webview_window("main") {
+                let _ = win.set_fullscreen(true);
+                let _ = win.show();
+                let _ = win.set_focus();
+            }
+            // Wait for the macOS fullscreen transition to settle.
+            tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+
+            return Ok(serde_json::json!({
+                "base64": b64,
+                "screenWidth": width,
+                "screenHeight": height
+            }));
+        }
+
+        #[allow(unreachable_code)]
+        {
+            if let Some(win) = app.get_webview_window("main") {
+                let _ = win.show();
+            }
+            Err("macOS-only command".to_string())
+        }
+    }
+
+    /// macOS: exit fullscreen after the user finishes the selection overlay.
+    #[tauri::command]
+    pub async fn exit_mac_capture(app: AppHandle) -> Result<(), String> {
         if let Some(win) = app.get_webview_window("main") {
             let _ = win.set_fullscreen(false);
             let _ = win.show();
@@ -579,6 +683,8 @@ pub fn run() {
             commands::set_always_on_top,
             commands::capture_full_screen_windows,
             commands::exit_windows_capture,
+            commands::capture_fullscreen_mac,
+            commands::exit_mac_capture,
             commands::save_history,
             commands::load_history,
         ])

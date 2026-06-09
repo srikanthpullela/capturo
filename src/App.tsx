@@ -704,10 +704,11 @@ export default function App() {
   // Coordinates are clamped to the canvas boundary so annotations never extend
   // past the visible edge.
   useEffect(() => {
-    const canvas = annCanvasRef.current;
-    if (!canvas) return;
-
-    const getClampedPos = (clientX: number, clientY: number): AnnPoint => {
+    // Read the canvas ref INSIDE the handlers (not at mount time) so this works
+    // even when the canvas is not yet rendered when the effect first runs.
+    const getClampedPos = (clientX: number, clientY: number): AnnPoint | null => {
+      const canvas = annCanvasRef.current;
+      if (!canvas) return null;
       const r = canvas.getBoundingClientRect();
       return {
         x: Math.max(0, Math.min(r.width,  clientX - r.left)),
@@ -717,8 +718,9 @@ export default function App() {
 
     const handleMove = (e: PointerEvent) => {
       if (!annDragging.current) return;
-      const pos  = getClampedPos(e.clientX, e.clientY);
-      const tool = annToolRef.current;
+      const pos = getClampedPos(e.clientX, e.clientY);
+      if (!pos) return;
+      const tool      = annToolRef.current;
       const color     = annColorRef.current;
       const lineWidth = annLineWidthRef.current;
 
@@ -780,7 +782,7 @@ export default function App() {
       document.removeEventListener('pointerup',   handleUp);
     };
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []); // empty deps — all state is accessed through always-current refs
+  }, []); // empty deps — canvas and all state accessed through refs, never stale
 
   // ── Global shortcut ──────────────────────────────────────────────────────
   useEffect(() => {

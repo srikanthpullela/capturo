@@ -48,6 +48,7 @@ interface Preferences {
   defaultFileName: string;
   captureDelay: 0 | 3 | 5;
   autoSavePath: string;
+  freezeCapture: boolean;
 }
 
 interface HistoryItem {
@@ -107,6 +108,7 @@ const DEFAULT_PREFS: Preferences = {
   defaultFileName: "Capturo-{datetime}",
   captureDelay: 0,
   autoSavePath: "",
+  freezeCapture: false,
 };
 
 function parseGradStops(css: string): string[] {
@@ -362,6 +364,9 @@ export default function App() {
   // persistHistory must never write to disk before this is set, otherwise a
   // failed/slow load would overwrite the existing file with fewer items.
   const historyDiskReady = useRef(!isTauri()); // browser mode is always ready
+  // Tracks which Rust command to invoke when the capture selection overlay exits.
+  // Set to 'exit_windows_capture' or 'exit_freeze_capture_mac' before showing overlay.
+  const overlayExitCmd = useRef<string>('exit_windows_capture');
   const dragRef = useRef<{ item: HistoryItem; startX: number; startY: number; grabOffsetX: number; grabOffsetY: number; active: boolean } | null>(null);
   const wasDraggingRef = useRef(false);
   const dragGhostRef = useRef<HTMLDivElement>(null);
@@ -999,12 +1004,13 @@ export default function App() {
   }, [composite]);
 
   // ── Capture flow ─────────────────────────────────────────────────────────
-  // macOS: uses screencapture -i (native system crosshair — covers the full
-  // screen including the menu bar). Windows: fullscreen overlay.
+  // macOS normal: screencapture -i (native system crosshair).
+  // macOS freeze: silent screenshot first → selection overlay (good for tooltips).
+  // Windows: fullscreen overlay.
   const triggerCapture = async () => {
     if (captureInProgress.current) return;  // prevent double-invoke
     captureInProgress.current = true;
-    const willHide = preferences.hideWindowOnCapture && !isWindows && isTauri();
+    const willHide = preferences.hideWindowOnCapture && !isWindows && isTauri() && !preferences.freezeCapture;
     if (willHide || preferences.captureDelay > 0) setMode("capturing");
     try {
       if (preferences.captureDelay > 0) {
@@ -1020,7 +1026,17 @@ export default function App() {
         return;
       }
       if (isWindows) {
+        overlayExitCmd.current = 'exit_windows_capture';
         const data = await invoke<{ base64: string; screenWidth: number; screenHeight: number }>('capture_full_screen_windows');
+        setWinCapture(data);
+        setMode('idle');
+        captureInProgress.current = false;
+        return;
+      }
+      // macOS freeze mode: capture first, then show overlay for leisurely selection.
+      if (preferences.freezeCapture) {
+        overlayExitCmd.current = 'exit_freeze_capture_mac';
+        const data = await invoke<{ base64: string; screenWidth: number; screenHeight: number }>('freeze_capture_mac');
         setWinCapture(data);
         setMode('idle');
         captureInProgress.current = false;
@@ -1062,10 +1078,10 @@ export default function App() {
   // Keep ref in sync on every render so the shortcut callback always uses latest preferences
   triggerCaptureRef.current = triggerCapture;
 
-  // ── Windows capture selection callback ───────────────────────────────────
+  // ── Capture overlay selection callback (Windows + macOS freeze) ──────────
   const handleWindowsSelection = async (b64: string) => {
     setWinCapture(null);
-    if (isTauri()) await invoke('exit_windows_capture').catch(() => {});
+    if (isTauri()) await invoke(overlayExitCmd.current).catch(() => {});
     setCroppedShot(b64);
     setAnnotations([]); setAnnDraft(null); setAnnTool(null);
     setMode('idle');
@@ -1511,7 +1527,7 @@ export default function App() {
           onCapture={handleWindowsSelection}
           onCancel={() => {
             setWinCapture(null);
-            if (isTauri()) invoke('exit_windows_capture').catch(() => {});
+            if (isTauri()) invoke(overlayExitCmd.current).catch(() => {});
             setMode('idle');
             captureInProgress.current = false;
           }}
@@ -2008,6 +2024,12 @@ export default function App() {
                   <section className="pref-section">
                     <div className="pref-section-title">Capture</div>
                     <label className="pref-toggle"><input type="checkbox" checked={preferences.hideWindowOnCapture} onChange={e => updatePref("hideWindowOnCapture", e.target.checked)} /><span>Hide Capturo while taking screenshot</span></label>
+                    {!isWindows && (
+                      <label className="pref-toggle">
+                        <input type="checkbox" checked={preferences.freezeCapture} onChange={e => updatePref("freezeCapture", e.target.checked)} />
+                        <span>Freeze screen before selecting <span style={{opacity:0.55, fontSize:"0.82em"}}>(captures tooltips & transient UI)</span></span>
+                      </label>
+                    )}
                     <label className="pref-toggle"><input type="checkbox" checked={preferences.hideAtLaunch} onChange={e => updatePref("hideAtLaunch", e.target.checked)} /><span>Always hide this window at launch</span></label>
                     <label className="pref-toggle"><input type="checkbox" checked={preferences.openAtLogin} onChange={e => updatePref("openAtLogin", e.target.checked)} /><span>Open Capturo at login</span></label>
                     <label className="pref-toggle"><input type="checkbox" checked={preferences.soundEffects} onChange={e => updatePref("soundEffects", e.target.checked)} /><span>Enable sound effects</span></label>

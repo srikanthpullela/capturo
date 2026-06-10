@@ -48,6 +48,7 @@ interface Preferences {
   defaultFileName: string;
   captureDelay: 0 | 3 | 5;
   autoSavePath: string;
+  freezeCapture: boolean;
 }
 
 interface HistoryItem {
@@ -107,6 +108,7 @@ const DEFAULT_PREFS: Preferences = {
   defaultFileName: "Capturo-{datetime}",
   captureDelay: 0,
   autoSavePath: "",
+  freezeCapture: false,
 };
 
 function parseGradStops(css: string): string[] {
@@ -187,7 +189,9 @@ function saveFolders(flds: Folder[]) {
   localStorage.setItem("capturo_folders", JSON.stringify(flds));
 }
 
-function parseHistoryItems(text: string | null): HistoryItem[] {
+// Returns null when the input text exists but cannot be parsed (corrupt JSON).
+// Returns [] for null/empty input (no file yet) or a valid empty array.
+function parseHistoryItems(text: string | null): HistoryItem[] | null {
   if (!text) return [];
   try {
     const parsed = JSON.parse(text);
@@ -203,7 +207,7 @@ function parseHistoryItems(text: string | null): HistoryItem[] {
       typeof item.shadow === "number"
     );
   } catch {
-    return [];
+    return null; // corrupt JSON — caller must not overwrite the source
   }
 }
 
@@ -345,10 +349,24 @@ export default function App() {
     const annDragId     = useRef<string | null>(null);
     const annDragOffset = useRef<AnnPoint>({ x: 0, y: 0 });
     const penPoints     = useRef<AnnPoint[]>([]);
+  // Always-current refs used by the document-level pointer listeners below.
+  // Assigned synchronously in render so they never go stale inside closures.
+  const annToolRef      = useRef<AnnTool>(null);
+  const annColorRef     = useRef("");
+  const annLineWidthRef = useRef(3);
+  const annDraftRef     = useRef<Annotation | null>(null);
+  const annotationsRef  = useRef<Annotation[]>([]);
   const toastTimer         = useRef<ReturnType<typeof setTimeout> | null>(null);
   const captureInProgress  = useRef(false);
   const compositeRef = useRef<() => void>(() => {});
   const historyRef = useRef<HistoryItem[]>([]);
+  // True once we have confirmed what is on disk (or confirmed fresh install).
+  // persistHistory must never write to disk before this is set, otherwise a
+  // failed/slow load would overwrite the existing file with fewer items.
+  const historyDiskReady = useRef(!isTauri()); // browser mode is always ready
+  // Tracks which Rust command to invoke when the capture selection overlay exits.
+  // Set to 'exit_windows_capture' or 'exit_freeze_capture_mac' before showing overlay.
+  const overlayExitCmd = useRef<string>('exit_windows_capture');
   const dragRef = useRef<{ item: HistoryItem; startX: number; startY: number; grabOffsetX: number; grabOffsetY: number; active: boolean } | null>(null);
   const wasDraggingRef = useRef(false);
   const dragGhostRef = useRef<HTMLDivElement>(null);
@@ -360,6 +378,13 @@ export default function App() {
   // Ref always pointing to the latest triggerCapture — used by the shortcut handler
   // so it picks up the latest preferences even though the effect runs only once.
   const triggerCaptureRef = useRef<() => Promise<void>>(() => Promise.resolve());
+
+  // Sync always-current refs with state (runs every render, no lag).
+  annToolRef.current      = annTool;
+  annColorRef.current     = annColor;
+  annLineWidthRef.current = annLineWidth;
+  annotationsRef.current  = annotations;
+  annDraftRef.current     = annDraft;
 
   // ── Displayed history (filtered by active folder) ────────────────────────
   const displayedHistory = useMemo(() =>
@@ -387,6 +412,9 @@ export default function App() {
       }
       return;
     }
+    // Guard: never write to disk before we have confirmed what is already there.
+    // This prevents a failed/slow startup load from destroying the existing file.
+    if (!historyDiskReady.current) return;
     invoke("save_history", { data: JSON.stringify(items) }).catch((e) => {
       console.error("save_history failed", e);
       showToast("History save failed");
@@ -629,7 +657,7 @@ export default function App() {
     redoStack.current = [];
   };
 
-  const onAnnMouseDown = (e: React.MouseEvent<HTMLCanvasElement>) => {
+  const onAnnMouseDown = (e: React.PointerEvent<HTMLCanvasElement>) => {
     const canvas = e.currentTarget as HTMLCanvasElement;
     const rect = canvas.getBoundingClientRect();
     if (rect.width === 0 || rect.height === 0) return;
@@ -684,53 +712,90 @@ export default function App() {
     e.preventDefault();
   };
 
-  const onAnnMouseMove = (e: React.MouseEvent<HTMLCanvasElement>) => {
-    const rect = (e.currentTarget as HTMLCanvasElement).getBoundingClientRect();
-    const pos: AnnPoint = { x: e.clientX - rect.left, y: e.clientY - rect.top };
+  // Global document listeners handle pointermove and pointerup so that drawing
+  // and annotation-dragging continue even when the cursor leaves the canvas.
+  // Coordinates are clamped to the canvas boundary so annotations never extend
+  // past the visible edge.
+  useEffect(() => {
+    // Read the canvas ref INSIDE the handlers (not at mount time) so this works
+    // even when the canvas is not yet rendered when the effect first runs.
+    const getClampedPos = (clientX: number, clientY: number): AnnPoint | null => {
+      const canvas = annCanvasRef.current;
+      if (!canvas) return null;
+      const r = canvas.getBoundingClientRect();
+      return {
+        x: Math.max(0, Math.min(r.width,  clientX - r.left)),
+        y: Math.max(0, Math.min(r.height, clientY - r.top)),
+      };
+    };
 
-    // Drag existing annotation
-    if (annDragId.current && annDragging.current) {
-      const newX1 = pos.x - annDragOffset.current.x;
-      const newY1 = pos.y - annDragOffset.current.y;
-      setAnnotations(prev => prev.map(a => {
-        if (a.id !== annDragId.current) return a;
-        const dx = newX1 - a.x1, dy = newY1 - a.y1;
-        return { ...a, x1: newX1, y1: newY1, x2: a.x2 + dx, y2: a.y2 + dy,
-          points: a.points?.map(p => ({ x: p.x + dx, y: p.y + dy })) };
-      }));
-      return;
-    }
+    const handleMove = (e: PointerEvent) => {
+      if (!annDragging.current) return;
+      const pos = getClampedPos(e.clientX, e.clientY);
+      if (!pos) return;
+      const tool      = annToolRef.current;
+      const color     = annColorRef.current;
+      const lineWidth = annLineWidthRef.current;
 
-    if (!annDragging.current || !annTool) return;
-    if (annTool === "pen") {
-      if (penPoints.current.length === 0) return; // safety: no start point yet
-      penPoints.current = [...penPoints.current, pos];
-      setAnnDraft({
-        id: "draft", tool: "pen",
-        x1: penPoints.current[0].x, y1: penPoints.current[0].y,
-        x2: pos.x, y2: pos.y,
-        color: annColor, lineWidth: annLineWidth,
-        points: [...penPoints.current],
-      });
-    } else {
-      setAnnDraft({
-        id: "draft", tool: annTool,
-        x1: annStart.current.x, y1: annStart.current.y,
-        x2: pos.x, y2: pos.y,
-        color: annColor, lineWidth: annLineWidth,
-      });
-    }
-  };
+      // Moving an existing annotation
+      if (annDragId.current) {
+        const newX1 = pos.x - annDragOffset.current.x;
+        const newY1 = pos.y - annDragOffset.current.y;
+        setAnnotations(prev => prev.map(a => {
+          if (a.id !== annDragId.current) return a;
+          const dx = newX1 - a.x1, dy = newY1 - a.y1;
+          return { ...a, x1: newX1, y1: newY1, x2: a.x2 + dx, y2: a.y2 + dy,
+            points: a.points?.map(p => ({ x: p.x + dx, y: p.y + dy })) };
+        }));
+        return;
+      }
 
-  const onAnnMouseUp = (_e?: React.MouseEvent<HTMLCanvasElement>) => {
-    if (annDragId.current) { annDragId.current = null; annDragging.current = false; return; }
-    if (!annDragging.current || !annTool || !annDraft) { annDragging.current = false; return; }
-    annDragging.current = false;
-    pushUndo(annotations);
-    setAnnotations(prev => [...prev, { ...annDraft, id: Date.now().toString() }]);
-    setAnnDraft(null);
-    if (annTool === "pen") penPoints.current = [];
-  };
+      if (!tool) return;
+      if (tool === "pen") {
+        if (penPoints.current.length === 0) return;
+        penPoints.current = [...penPoints.current, pos];
+        const draft: Annotation = {
+          id: "draft", tool: "pen",
+          x1: penPoints.current[0].x, y1: penPoints.current[0].y,
+          x2: pos.x, y2: pos.y, color, lineWidth,
+          points: [...penPoints.current],
+        };
+        annDraftRef.current = draft;
+        setAnnDraft(draft);
+      } else {
+        const draft: Annotation = {
+          id: "draft", tool,
+          x1: annStart.current.x, y1: annStart.current.y,
+          x2: pos.x, y2: pos.y, color, lineWidth,
+        };
+        annDraftRef.current = draft;
+        setAnnDraft(draft);
+      }
+    };
+
+    const handleUp = () => {
+      if (annDragId.current) { annDragId.current = null; annDragging.current = false; return; }
+      if (!annDragging.current) return;
+      annDragging.current = false;
+      const tool  = annToolRef.current;
+      const draft = annDraftRef.current;
+      if (!tool || !draft) { annDraftRef.current = null; setAnnDraft(null); return; }
+      undoStack.current.push([...annotationsRef.current]);
+      redoStack.current = [];
+      setAnnotations(prev => [...prev, { ...draft, id: Date.now().toString() }]);
+      annDraftRef.current = null;
+      setAnnDraft(null);
+      if (tool === "pen") penPoints.current = [];
+    };
+
+    document.addEventListener('pointermove', handleMove);
+    document.addEventListener('pointerup',   handleUp);
+    return () => {
+      document.removeEventListener('pointermove', handleMove);
+      document.removeEventListener('pointerup',   handleUp);
+    };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []); // empty deps — canvas and all state accessed through refs, never stale
 
   // ── Global shortcut ──────────────────────────────────────────────────────
   useEffect(() => {
@@ -854,46 +919,70 @@ export default function App() {
     return () => window.removeEventListener("keydown", onKey);
   }, []);
 
-  // ── Load history from disk on mount (no localStorage 5MB quota) ──────────
-  useEffect(() => {
-    historyRef.current = history;
-  }, [history]);
-
+  // ── Load history on mount ────────────────────────────────────────────────
+  // Deps: [] — runs exactly once. We intentionally do NOT include persistHistory
+  // here; re-running on every preference change was a bug that could overwrite
+  // the disk file with stale in-memory state.
   useEffect(() => {
     if (!isTauri()) {
-      try {
-        const parsed = parseHistoryItems(localStorage.getItem("capturo_history"));
-        historyRef.current = parsed;
-        if (parsed.length > 0) setHistory(parsed);
-      } catch {}
+      // Browser fallback: localStorage is the only source.
+      const parsed = parseHistoryItems(localStorage.getItem("capturo_history")) ?? [];
+      historyRef.current = parsed;
+      if (parsed.length > 0) setHistory(parsed);
+      // historyDiskReady is pre-set to true for non-Tauri in the ref initializer.
       setHistoryLoaded(true);
       return;
     }
     (async () => {
-      let diskHistory: HistoryItem[] = [];
-      let diskLoadOk = false;
-      let browserHistory: HistoryItem[] = [];
-      try {
-        const text = await invoke<string>("load_history");
-        diskHistory = parseHistoryItems(text);
-        diskLoadOk = true;
-      } catch (e) {
-        console.error("load_history failed — keeping disk file unchanged", e);
+      type LoadResult = { status: string; data?: string; message?: string };
+      const result = await invoke<LoadResult>("load_history");
+
+      if (result.status === "error") {
+        // Real I/O error (permissions, disk, etc.).
+        // Leave historyDiskReady=false so persistHistory won't overwrite.
+        console.error("load_history I/O error:", result.message);
+        showToast("Could not load history — existing data preserved");
+        setHistoryLoaded(true);
+        return;
       }
-      // Merge current localStorage key + legacy "snapcraft_history" key
-      const legacyHistory = parseHistoryItems(localStorage.getItem("snapcraft_history"));
-      browserHistory = parseHistoryItems(localStorage.getItem("capturo_history"));
-      const merged = mergeHistoryItems(diskHistory, browserHistory, legacyHistory);
-      historyRef.current = merged;
-      setHistory(merged);
+
+      if (result.status === "missing") {
+        // Fresh install: no file yet. Check legacy localStorage keys for
+        // one-time migration before we create the disk file.
+        const legacy = parseHistoryItems(localStorage.getItem("snapcraft_history")) ?? [];
+        const browser = parseHistoryItems(localStorage.getItem("capturo_history")) ?? [];
+        const migrated = mergeHistoryItems(legacy, browser);
+        historyRef.current = migrated;
+        setHistory(migrated);
+        historyDiskReady.current = true;
+        setHistoryLoaded(true);
+        // Write the migrated data to disk immediately so next launch loads from disk.
+        if (migrated.length > 0) {
+          invoke("save_history", { data: JSON.stringify(migrated) }).catch(console.error);
+        }
+        return;
+      }
+
+      // status === "ok": file read successfully.
+      const parsed = parseHistoryItems(result.data ?? null);
+      if (parsed === null) {
+        // Corrupt JSON in the disk file. Preserve it; don't overwrite.
+        console.error("capturo_history.json contains corrupt JSON — preserved unchanged");
+        showToast("History file is corrupt — please contact support");
+        setHistoryLoaded(true);
+        // historyDiskReady stays false
+        return;
+      }
+
+      historyRef.current = parsed;
+      setHistory(parsed);
+      historyDiskReady.current = true;
       setHistoryLoaded(true);
-      // CRITICAL: only overwrite disk if we successfully loaded from it.
-      // Overwriting on a failed load would destroy items already on disk.
-      if (diskLoadOk) {
-        persistHistory(merged, true);
-      }
+      // Re-save immediately to normalise format (e.g. add new default fields).
+      invoke("save_history", { data: JSON.stringify(parsed) }).catch(console.error);
     })();
-  }, [persistHistory]);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []); // intentional empty deps — see comment above
 
   // ── History persistence ───────────────────────────────────────────────────
   useEffect(() => {
@@ -915,15 +1004,13 @@ export default function App() {
   }, [composite]);
 
   // ── Capture flow ─────────────────────────────────────────────────────────
-  // Uses screencapture -i: hides window → native macOS crosshair → returns cropped PNG.
-  // No fullscreen mode, no custom selection overlay needed.
+  // macOS normal: screencapture -i (native system crosshair).
+  // macOS freeze: silent screenshot first → selection overlay (good for tooltips).
+  // Windows: fullscreen overlay.
   const triggerCapture = async () => {
     if (captureInProgress.current) return;  // prevent double-invoke
     captureInProgress.current = true;
-    // Only show the full-screen capturing overlay when the window will be hidden
-    // (so the user sees feedback while the window is gone). When not hiding, keep
-    // the normal UI visible — showing a black "Preparing capture…" over it is confusing.
-    const willHide = preferences.hideWindowOnCapture && !isWindows && isTauri();
+    const willHide = preferences.hideWindowOnCapture && !isWindows && isTauri() && !preferences.freezeCapture;
     if (willHide || preferences.captureDelay > 0) setMode("capturing");
     try {
       if (preferences.captureDelay > 0) {
@@ -939,7 +1026,17 @@ export default function App() {
         return;
       }
       if (isWindows) {
+        overlayExitCmd.current = 'exit_windows_capture';
         const data = await invoke<{ base64: string; screenWidth: number; screenHeight: number }>('capture_full_screen_windows');
+        setWinCapture(data);
+        setMode('idle');
+        captureInProgress.current = false;
+        return;
+      }
+      // macOS freeze mode: capture first, then show overlay for leisurely selection.
+      if (preferences.freezeCapture) {
+        overlayExitCmd.current = 'exit_freeze_capture_mac';
+        const data = await invoke<{ base64: string; screenWidth: number; screenHeight: number }>('freeze_capture_mac');
         setWinCapture(data);
         setMode('idle');
         captureInProgress.current = false;
@@ -981,10 +1078,10 @@ export default function App() {
   // Keep ref in sync on every render so the shortcut callback always uses latest preferences
   triggerCaptureRef.current = triggerCapture;
 
-  // ── Windows capture selection callback ───────────────────────────────────
+  // ── Capture overlay selection callback (Windows + macOS freeze) ──────────
   const handleWindowsSelection = async (b64: string) => {
     setWinCapture(null);
-    if (isTauri()) await invoke('exit_windows_capture').catch(() => {});
+    if (isTauri()) await invoke(overlayExitCmd.current).catch(() => {});
     setCroppedShot(b64);
     setAnnotations([]); setAnnDraft(null); setAnnTool(null);
     setMode('idle');
@@ -1421,7 +1518,7 @@ export default function App() {
   return (
     <div className="app">
 
-      {/* ── WINDOWS CAPTURE OVERLAY ── */}
+      {/* ── CAPTURE SELECTION OVERLAY (Windows & macOS) ── */}
       {winCapture && (
         <WinSelectionOverlay
           base64={winCapture.base64}
@@ -1430,7 +1527,7 @@ export default function App() {
           onCapture={handleWindowsSelection}
           onCancel={() => {
             setWinCapture(null);
-            if (isTauri()) invoke('exit_windows_capture').catch(() => {});
+            if (isTauri()) invoke(overlayExitCmd.current).catch(() => {});
             setMode('idle');
             captureInProgress.current = false;
           }}
@@ -1604,11 +1701,9 @@ export default function App() {
                           style={{
                             cursor: annTool === "text" ? "text" : annTool === "pen" ? PEN_CURSOR : annTool === "eraser" ? ERASER_CURSOR : annTool ? "crosshair" : annotations.length > 0 ? "grab" : "default",
                             pointerEvents: (textInput || zoom !== 1) ? "none" : undefined,
+                            touchAction: "none",
                           }}
-                          onMouseDown={onAnnMouseDown}
-                          onMouseMove={onAnnMouseMove}
-                          onMouseUp={onAnnMouseUp}
-                          onMouseLeave={onAnnMouseUp}
+                          onPointerDown={onAnnMouseDown}
                         />
                         {textInput && (
                           <>
@@ -1929,6 +2024,12 @@ export default function App() {
                   <section className="pref-section">
                     <div className="pref-section-title">Capture</div>
                     <label className="pref-toggle"><input type="checkbox" checked={preferences.hideWindowOnCapture} onChange={e => updatePref("hideWindowOnCapture", e.target.checked)} /><span>Hide Capturo while taking screenshot</span></label>
+                    {!isWindows && (
+                      <label className="pref-toggle">
+                        <input type="checkbox" checked={preferences.freezeCapture} onChange={e => updatePref("freezeCapture", e.target.checked)} />
+                        <span>Freeze screen before selecting <span style={{opacity:0.55, fontSize:"0.82em"}}>(captures tooltips & transient UI)</span></span>
+                      </label>
+                    )}
                     <label className="pref-toggle"><input type="checkbox" checked={preferences.hideAtLaunch} onChange={e => updatePref("hideAtLaunch", e.target.checked)} /><span>Always hide this window at launch</span></label>
                     <label className="pref-toggle"><input type="checkbox" checked={preferences.openAtLogin} onChange={e => updatePref("openAtLogin", e.target.checked)} /><span>Open Capturo at login</span></label>
                     <label className="pref-toggle"><input type="checkbox" checked={preferences.soundEffects} onChange={e => updatePref("soundEffects", e.target.checked)} /><span>Enable sound effects</span></label>
@@ -2080,15 +2181,17 @@ function WinSelectionOverlay({ base64, screenWidth, screenHeight, onCapture, onC
     }
   }, [rect]);
 
-  const handleMouseDown = (e: React.MouseEvent) => {
+  const handleMouseDown = (e: React.PointerEvent<HTMLDivElement>) => {
+    (e.currentTarget as HTMLDivElement).setPointerCapture(e.pointerId);
     setDrag({ x: e.clientX, y: e.clientY });
     setRect(null);
   };
-  const handleMouseMove = (e: React.MouseEvent) => {
+  const handleMouseMove = (e: React.PointerEvent<HTMLDivElement>) => {
     if (!drag) return;
     setRect({ x: Math.min(drag.x, e.clientX), y: Math.min(drag.y, e.clientY), w: Math.abs(e.clientX - drag.x), h: Math.abs(e.clientY - drag.y) });
   };
-  const handleMouseUp = () => {
+  const handleMouseUp = (e: React.PointerEvent<HTMLDivElement>) => {
+    (e.currentTarget as HTMLDivElement).releasePointerCapture(e.pointerId);
     if (!drag || !rect || rect.w < 10 || rect.h < 10) { setDrag(null); setRect(null); return; }
     setDrag(null);
     const img = imgRef.current;
@@ -2108,9 +2211,9 @@ function WinSelectionOverlay({ base64, screenWidth, screenHeight, onCapture, onC
     <div
       className="win-capture-overlay"
       tabIndex={0}
-      onMouseDown={handleMouseDown}
-      onMouseMove={handleMouseMove}
-      onMouseUp={handleMouseUp}
+      onPointerDown={handleMouseDown}
+      onPointerMove={handleMouseMove}
+      onPointerUp={handleMouseUp}
       onKeyDown={e => { if (e.key === 'Escape') onCancel(); }}
       ref={el => el?.focus()}
     >
